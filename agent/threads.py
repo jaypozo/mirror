@@ -1,28 +1,28 @@
-"""Project-aware goal / per-project state.
+"""Thread-aware goal / per-thread state.
 
-The owner runs MULTIPLE projects interleaved in ONE conversation. A flat summary
-of the last N messages cannot tell which project a message belongs to, nor track
+The owner runs MULTIPLE threads interleaved in ONE conversation. A flat summary
+of the last N messages cannot tell which thread a message belongs to, nor track
 where in a task we are. This module segments each incoming message to the
-best-matching active project (or opens a new one) and maintains per-project
+best-matching active thread (or opens a new one) and maintains per-thread
 `goal`, `current_task`, and `stage`, so the Goal/Now/Next summary and the draft
-reflect the RIGHT project's objective — not a linear window.
+reflect the RIGHT thread's objective — not a linear window.
 
 Design (pragmatic, one extra LLM call per draft — it REPLACES the flat summary
 call, so drafting stays at ~one exec for the reply + one for the state/summary):
 
   1. Embed the incoming message locally (the same on-box model retrieval uses).
-  2. Pre-rank candidate projects by cosine distance to their stored
+  2. Pre-rank candidate threads by cosine distance to their stored
      `anchor_embedding` (falling back to most-recently-updated), so the labeler
      only sees a short, relevant candidate list.
   3. ONE LLM call does segmentation + state update + summary together: given the
-     incoming message, recent thread, the candidate projects, and the matched
-     project's recent intent notes (decisions), it returns which project this is
-     (or a new one) AND the refreshed goal/current_task/stage AND a project-aware
+     incoming message, recent thread, the candidate threads, and the matched
+     thread's recent intent notes (decisions), it returns which thread this is
+     (or a new one) AND the refreshed goal/current_task/stage AND a thread-aware
      goal/now/next/open.
-  4. Upsert the project (new row or update the matched one), recomputing its
+  4. Upsert the thread (new row or update the matched one), recomputing its
      anchor embedding.
 
-Everything is guarded: on any failure `resolve_project` returns None and the
+Everything is guarded: on any failure `resolve_thread` returns None and the
 caller falls back to the flat `summarize_thread`, so drafting always works.
 """
 
@@ -42,20 +42,20 @@ from agent.types import ChatMessage, ThreadSummary
 
 VALID_STAGES = {"mid-step", "awaiting-owner", "done"}
 
-# How many candidate projects to show the labeler, and how many recent intent
+# How many candidate threads to show the labeler, and how many recent intent
 # notes to feed the state update / draft.
 MAX_CANDIDATES = 10
 MAX_INTENT_NOTES = 6
 
 
 @dataclass(frozen=True)
-class ProjectState:
+class ThreadState:
     id: int
     title: str
     goal: str
     current_task: str
     stage: str
-    # goal/now/next/open the labeler produced for THIS message (project-aware).
+    # goal/now/next/open the labeler produced for THIS message (thread-aware).
     summary: ThreadSummary = field(
         default_factory=lambda: ThreadSummary.empty()
     )
@@ -65,8 +65,8 @@ class ProjectState:
 
 
 @dataclass(frozen=True)
-class ProjectContext:
-    state: ProjectState
+class ThreadContext:
+    state: ThreadState
     intent_notes: list[str] = field(default_factory=list)
 
 
@@ -80,7 +80,7 @@ async def _embed(text: str) -> list[float] | None:
         vec = await embed_query(text)
         return list(vec) if vec else None
     except Exception as exc:  # pragma: no cover - embedding is best-effort
-        print(f"[projects] embed failed (ignored): {exc}", file=sys.stderr)
+        print(f"[threads] embed failed (ignored): {exc}", file=sys.stderr)
         return None
 
 
@@ -101,21 +101,21 @@ async def _connect() -> asyncpg.Connection | None:
     try:
         return await asyncpg.connect(database_url)
     except Exception as exc:
-        print(f"[projects] connect failed (ignored): {exc}", file=sys.stderr)
+        print(f"[threads] connect failed (ignored): {exc}", file=sys.stderr)
         return None
 
 
 async def _fetch_candidates(
     conn: asyncpg.Connection, query_vec: str | None, limit: int
 ) -> list[dict]:
-    """Candidate projects for the labeler: nearest by anchor embedding when we
-    have a query vector, else the most-recently-updated. Done projects are
+    """Candidate threads for the labeler: nearest by anchor embedding when we
+    have a query vector, else the most-recently-updated. Done threads are
     included (a message can reopen one) but rank last by recency."""
     if query_vec is not None:
         rows = await conn.fetch(
             """
             SELECT id, title, goal, current_task, stage
-            FROM projects
+            FROM threads
             ORDER BY anchor_embedding <=> $1::vector NULLS LAST, updated_at DESC
             LIMIT $2
             """,
@@ -126,7 +126,7 @@ async def _fetch_candidates(
         rows = await conn.fetch(
             """
             SELECT id, title, goal, current_task, stage
-            FROM projects
+            FROM threads
             ORDER BY updated_at DESC
             LIMIT $1
             """,
@@ -136,17 +136,17 @@ async def _fetch_candidates(
 
 
 async def _recent_intent_notes(
-    conn: asyncpg.Connection, project_id: int, limit: int = MAX_INTENT_NOTES
+    conn: asyncpg.Connection, thread_id: int, limit: int = MAX_INTENT_NOTES
 ) -> list[str]:
     rows = await conn.fetch(
         """
         SELECT note
         FROM intent_notes
-        WHERE project_id = $1 AND note IS NOT NULL AND length(trim(note)) > 0
+        WHERE thread_id = $1 AND note IS NOT NULL AND length(trim(note)) > 0
         ORDER BY ts DESC
         LIMIT $2
         """,
-        project_id,
+        thread_id,
         limit,
     )
     return [r["note"].strip() for r in rows]
@@ -155,25 +155,25 @@ async def _recent_intent_notes(
 # --------------------------------------------------------------------------- #
 # LLM segmentation + state update + summary (one call).
 # --------------------------------------------------------------------------- #
-_SEGMENT_SYSTEM_PROMPT = """You track the owner's interleaved projects in a single ongoing conversation.
+_SEGMENT_SYSTEM_PROMPT = """You track the owner's interleaved threads in a single ongoing conversation.
 
-You are given the incoming message, a little recent thread, a list of the owner's KNOWN active projects (with id, title, goal, current task, stage), and recent DECISIONS the owner has locked in on the best-matching project. Decide which project the incoming message belongs to, then refresh that project's state and summarize it.
+You are given the incoming message, a little recent thread, a list of the owner's KNOWN active threads (with id, title, goal, current task, stage), and recent DECISIONS the owner has locked in on the best-matching thread. Decide which thread the incoming message belongs to, then refresh that thread's state and summarize it.
 
 Return ONLY compact JSON, no prose:
 {
-  "match_id": <the id of the matching known project, or null if this starts a NEW project>,
-  "title": "<short project title>",
-  "goal": "<the project's overall objective, one line>",
+  "match_id": <the id of the matching known thread, or null if this starts a NEW thread>,
+  "title": "<short thread title>",
+  "goal": "<the thread's overall objective, one line>",
   "current_task": "<the specific task in flight right now>",
   "stage": "mid-step" | "awaiting-owner" | "done",
-  "keywords": ["<a few distinctive keywords/anchors for this project>"],
-  "now": "<current state or blocker for this project>",
+  "keywords": ["<a few distinctive keywords/anchors for this thread>"],
+  "now": "<current state or blocker for this thread>",
   "next": "<the next concrete action the owner should take>",
   "open": ["<unresolved question or missing fact>", "..."]
 }
 
 Rules:
-- Prefer matching an existing project when the message plausibly continues it; only open a new project when it clearly does not fit any.
+- Prefer matching an existing thread when the message plausibly continues it; only open a new thread when it clearly does not fit any.
 - stage: "mid-step" = actively in progress; "awaiting-owner" = blocked on the owner's input/decision; "done" = the task is complete.
 - Honor the locked-in decisions: goal/current_task/now/next must be consistent with them, not with a stale earlier plan.
 - Keep every field tight. Do not invent facts the messages do not support."""
@@ -187,7 +187,7 @@ def _thread_block(thread: list[ChatMessage], limit: int = 12) -> str:
 
 def _candidates_block(candidates: list[dict]) -> str:
     if not candidates:
-        return "(no known projects yet)"
+        return "(no known threads yet)"
     lines = []
     for c in candidates:
         lines.append(
@@ -213,10 +213,10 @@ def _build_segment_prompt(
 RECENT THREAD:
 {_thread_block(thread)}
 
-KNOWN ACTIVE PROJECTS:
+KNOWN ACTIVE THREADS:
 {_candidates_block(candidates)}
 
-RECENT LOCKED-IN DECISIONS (for the best-matching known project):
+RECENT LOCKED-IN DECISIONS (for the best-matching known thread):
 {notes_block}
 
 Return only the JSON object described in the instructions."""
@@ -249,7 +249,7 @@ def _summary_from_decision(decision: dict) -> ThreadSummary:
     open_items = decision.get("open", [])
     if isinstance(open_items, str):
         open_items = [open_items]
-    goal = str(decision.get("goal") or "").strip() or "Advance the current project."
+    goal = str(decision.get("goal") or "").strip() or "Advance the current thread."
     now = str(decision.get("now") or "").strip() or "Review the latest message."
     nxt = str(decision.get("next") or "").strip() or "Take the next concrete step."
     return ThreadSummary(
@@ -260,12 +260,12 @@ def _summary_from_decision(decision: dict) -> ThreadSummary:
     )
 
 
-async def _upsert_project(
+async def _upsert_thread(
     conn: asyncpg.Connection,
     decision: dict,
     candidate_ids: set[int],
-) -> ProjectState | None:
-    title = str(decision.get("title") or "").strip() or "Untitled project"
+) -> ThreadState | None:
+    title = str(decision.get("title") or "").strip() or "Untitled thread"
     goal = str(decision.get("goal") or "").strip()
     current_task = str(decision.get("current_task") or "").strip()
     stage = _coerce_stage(decision.get("stage"))
@@ -275,7 +275,7 @@ async def _upsert_project(
     keywords = [str(k).strip() for k in keywords if str(k).strip()][:12]
     anchors = {"keywords": keywords}
 
-    # Anchor embedding from the project's distinctive text (title + goal + keys).
+    # Anchor embedding from the thread's distinctive text (title + goal + keys).
     anchor_text = " ".join([title, goal, " ".join(keywords)]).strip()
     anchor_vec = _vector_literal(await _embed(anchor_text)) if anchor_text else None
 
@@ -292,7 +292,7 @@ async def _upsert_project(
     if match_id is not None:
         row = await conn.fetchrow(
             """
-            UPDATE projects
+            UPDATE threads
                SET title = $2, goal = $3, current_task = $4, stage = $5,
                    anchors = $6::jsonb,
                    anchor_embedding = COALESCE($7::vector, anchor_embedding),
@@ -311,7 +311,7 @@ async def _upsert_project(
     else:
         row = await conn.fetchrow(
             """
-            INSERT INTO projects
+            INSERT INTO threads
                 (title, goal, current_task, stage, anchors, anchor_embedding)
             VALUES ($1, $2, $3, $4, $5::jsonb, $6::vector)
             RETURNING id, title, goal, current_task, stage
@@ -325,7 +325,7 @@ async def _upsert_project(
         )
     if row is None:
         return None
-    return ProjectState(
+    return ThreadState(
         id=row["id"],
         title=row["title"],
         goal=row["goal"] or "",
@@ -338,13 +338,13 @@ async def _upsert_project(
 # --------------------------------------------------------------------------- #
 # Public API.
 # --------------------------------------------------------------------------- #
-async def resolve_project(
+async def resolve_thread(
     incoming_message: str,
     thread: list[ChatMessage] | None = None,
     llm: LLMClient | None = None,
-) -> ProjectContext | None:
-    """Segment `incoming_message` to a project (matching or new), update that
-    project's state, and return it with its recent intent notes. Fully guarded:
+) -> ThreadContext | None:
+    """Segment `incoming_message` to a thread (matching or new), update that
+    thread's state, and return it with its recent intent notes. Fully guarded:
     returns None on any failure so the caller falls back to the flat summary."""
     incoming = (incoming_message or "").strip()
     if not incoming:
@@ -382,26 +382,26 @@ async def resolve_project(
                 ]
             )
         except Exception as exc:
-            print(f"[projects] segmentation LLM failed (ignored): {exc}", file=sys.stderr)
+            print(f"[threads] segmentation LLM failed (ignored): {exc}", file=sys.stderr)
             return None
 
         decision = _parse_decision(raw)
         if not decision:
             return None
 
-        state = await _upsert_project(conn, decision, candidate_ids)
+        state = await _upsert_thread(conn, decision, candidate_ids)
         if state is None:
             return None
 
-        # Intent notes to inject into the draft: the matched project's own recent
-        # decisions (re-fetch in case we just matched a project we didn't pre-load).
+        # Intent notes to inject into the draft: the matched thread's own recent
+        # decisions (re-fetch in case we just matched a thread we didn't pre-load).
         try:
             notes = await _recent_intent_notes(conn, state.id)
         except Exception:
             notes = pre_notes
-        return ProjectContext(state=state, intent_notes=notes)
+        return ThreadContext(state=state, intent_notes=notes)
     except Exception as exc:
-        print(f"[projects] resolve_project failed (ignored): {exc}", file=sys.stderr)
+        print(f"[threads] resolve_thread failed (ignored): {exc}", file=sys.stderr)
         return None
     finally:
         await conn.close()
@@ -410,7 +410,7 @@ async def resolve_project(
 async def record_intent_note(
     *,
     note: str,
-    project_id: int | None = None,
+    thread_id: int | None = None,
     feedback_id: int | None = None,
     source_chat_id: int | None = None,
     source_message_id: int | None = None,
@@ -427,16 +427,16 @@ async def record_intent_note(
         await conn.execute(
             """
             INSERT INTO intent_notes
-                (project_id, feedback_id, note, source_chat_id, source_message_id)
+                (thread_id, feedback_id, note, source_chat_id, source_message_id)
             VALUES ($1, $2, $3, $4, $5)
             """,
-            project_id,
+            thread_id,
             feedback_id,
             note,
             source_chat_id,
             source_message_id,
         )
     except Exception as exc:
-        print(f"[projects] record_intent_note failed (ignored): {exc}", file=sys.stderr)
+        print(f"[threads] record_intent_note failed (ignored): {exc}", file=sys.stderr)
     finally:
         await conn.close()

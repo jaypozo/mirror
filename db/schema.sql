@@ -83,14 +83,14 @@ ALTER TABLE feedback ADD COLUMN IF NOT EXISTS edit_note text;
 CREATE INDEX IF NOT EXISTS feedback_edit_kind_ts_idx
     ON feedback (edit_kind, ts);
 
--- Project-aware state. The owner interleaves MULTIPLE projects in one
+-- Thread-aware state. The owner interleaves MULTIPLE threads in one
 -- conversation. Each incoming message is segmented to the best-matching active
--- project (embedding pre-rank over `anchor_embedding` + a cheap LLM labeler in
--- agent/projects.py), or a new project is opened. Per-project `goal`,
+-- thread (embedding pre-rank over `anchor_embedding` + a cheap LLM labeler in
+-- agent/threads.py), or a new thread is opened. Per-thread `goal`,
 -- `current_task`, and `stage` are maintained (LLM update step) so the Goal/Now/
--- Next summary and the draft reflect the matched project's objective and where in
+-- Next summary and the draft reflect the matched thread's objective and where in
 -- the task we are — not a flat window of recent messages.
-CREATE TABLE IF NOT EXISTS projects (
+CREATE TABLE IF NOT EXISTS threads (
     id bigserial PRIMARY KEY,
     title text NOT NULL,
     goal text,
@@ -103,18 +103,18 @@ CREATE TABLE IF NOT EXISTS projects (
     updated_at timestamptz NOT NULL DEFAULT now()
 );
 
-CREATE INDEX IF NOT EXISTS projects_updated_at_idx
-    ON projects (updated_at DESC);
+CREATE INDEX IF NOT EXISTS threads_updated_at_idx
+    ON threads (updated_at DESC);
 
 -- Intent/decision learning channel. Captured from INTENT/BOTH edits (Build 1):
 -- what the owner actually decided or intended, tied to the feedback row that
--- produced it and to the project it belongs to (Build 2). Recent notes for the
--- matched project are injected into the draft prompt + the project state update,
+-- produced it and to the thread it belongs to (Build 2). Recent notes for the
+-- matched thread are injected into the draft prompt + the thread state update,
 -- so future goal-summaries and drafts reflect real decisions rather than a stale
 -- draft's guess.
 CREATE TABLE IF NOT EXISTS intent_notes (
     id bigserial PRIMARY KEY,
-    project_id bigint REFERENCES projects (id) ON DELETE SET NULL,
+    thread_id bigint REFERENCES threads (id) ON DELETE SET NULL,
     feedback_id bigint REFERENCES feedback (id) ON DELETE SET NULL,
     note text NOT NULL,
     source_chat_id bigint,
@@ -122,8 +122,8 @@ CREATE TABLE IF NOT EXISTS intent_notes (
     ts timestamptz NOT NULL DEFAULT now()
 );
 
-CREATE INDEX IF NOT EXISTS intent_notes_project_ts_idx
-    ON intent_notes (project_id, ts DESC);
+CREATE INDEX IF NOT EXISTS intent_notes_thread_ts_idx
+    ON intent_notes (thread_id, ts DESC);
 
 -- Living style sheet: a distilled "how the owner writes" guide, regenerated
 -- periodically (agent/style_sheet.py) PRIMARILY from the owner's own message

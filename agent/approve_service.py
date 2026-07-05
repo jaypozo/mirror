@@ -57,7 +57,7 @@ from agent.draft import draft_reply
 from agent.edit_classify import classify_edit
 from agent.eligibility import EXCLUDED_TOPIC_CHAT_ID
 from agent.feedback import record_feedback
-from agent.projects import record_intent_note
+from agent.threads import record_intent_note
 from agent.service import maybe_resume_backfill  # reuse the drip resumer as-is
 from agent.types import ChatMessage, DraftRequest, DraftResult
 
@@ -348,13 +348,13 @@ async def handle_decide(request: web.Request) -> web.Response:
         )
 
         # INTENT component (Build 1 -> Build 2): a decision/substance change is
-        # captured as a durable intent note against the matched project, so future
+        # captured as a durable intent note against the matched thread, so future
         # summaries + drafts reflect the real decision. Guarded.
         if action == "edit" and edit_kind in ("intent", "both"):
             try:
                 await record_intent_note(
                     note=(edit_note or final),
-                    project_id=pending.result.project_id,
+                    thread_id=pending.result.thread_id,
                     feedback_id=feedback_id,
                     source_chat_id=pending.request.source_chat_id,
                     source_message_id=pending.request.source_message_id,

@@ -161,32 +161,32 @@ the `feedback` row (`edit_kind`, `edit_note`). Learning is then **routed**:
   pure `intent`** — a decision change never trains voice.
 - **INTENT / BOTH → the intent/decision channel.** The what-changed note is stored
   as a durable **intent note** (`intent_notes`) tied to the feedback row and the
-  matched project (below), so future goal-summaries and drafts reflect what the
+  matched thread (below), so future goal-summaries and drafts reflect what the
   owner actually decided, not a stale draft's guess.
 
 A classify/DB failure degrades to a local heuristic and never blocks capture or
 sending.
 
-### Project-aware goal state (`agent/projects.py`)
+### Thread-aware goal state (`agent/threads.py`)
 
-The owner runs **multiple projects interleaved in one conversation**. A flat
-summary of the last N messages can't tell which project a message belongs to, nor
+The owner runs **multiple threads interleaved in one conversation**. A flat
+summary of the last N messages can't tell which thread a message belongs to, nor
 track where in a task we are. Mirror now segments each incoming message to the
-best-matching **active project** (or opens a new one) and maintains per-project
+best-matching **active thread** (or opens a new one) and maintains per-thread
 `goal`, `current_task`, and `stage` (`mid-step | awaiting-owner | done`):
 
 1. Embed the incoming message locally (the same on-box encoder retrieval uses)
-   and **pre-rank** candidate projects by cosine distance to their stored
+   and **pre-rank** candidate threads by cosine distance to their stored
    `anchor_embedding` (falling back to most-recently-updated).
 2. **One LLM call** does segmentation + state update + summary together: given the
-   message, recent thread, the candidate projects, and the matched project's
-   recent intent notes (locked-in decisions), it returns which project this is (or
-   a new one), the refreshed goal/current_task/stage, and a project-aware
+   message, recent thread, the candidate threads, and the matched thread's
+   recent intent notes (locked-in decisions), it returns which thread this is (or
+   a new one), the refreshed goal/current_task/stage, and a thread-aware
    goal/now/next/open. This call **replaces** the flat `summarize_thread` call, so
    drafting stays at the same ~one-exec-for-the-reply + one-for-state cost.
-3. The matched project's state + recent decisions are injected into the draft
+3. The matched thread's state + recent decisions are injected into the draft
    prompt so the reply understands the objective and where in the task we are, and
-   the project-aware summary becomes the card's Goal/Now/Next.
+   the thread-aware summary becomes the card's Goal/Now/Next.
 
 An agent-supplied Goal/Now/Next (passed in the request) is still honored. If
 segmentation or state update fails, it falls back to the flat `summarize_thread`
@@ -258,8 +258,8 @@ corpus.
 1. **Edit-feedback loop** — recency+magnitude-weighted, capped. **Shipped.**
 2. **Living style sheet** with staged rule promotion + decay. **Shipped.**
 3. **Dual learning (STYLE vs. INTENT edits)** — classify each edit; route style to
-   the voice channel and intent to per-project decision notes. **Shipped.**
-4. **Project-aware goal state** — segment interleaved projects; per-project
+   the voice channel and intent to per-thread decision notes. **Shipped.**
+4. **Thread-aware goal state** — segment interleaved threads; per-thread
    goal/current_task/stage feeds the summary + draft. **Shipped.**
 5. **Style-based retrieval (D)** — add a style-embedding index; select exemplars
    by style, not topic.

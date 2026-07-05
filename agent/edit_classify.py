@@ -11,7 +11,7 @@ Why it matters: treating every edit the same trains the voice model on decision
 changes (so a fact correction would teach the drafter a phrasing "rule" it never
 was). Classification routes each edit to the right channel:
   * STYLE / BOTH  -> voice (style sheet + edit few-shots).
-  * INTENT / BOTH -> intent notes (per-project decisions).
+  * INTENT / BOTH -> intent notes (per-thread decisions).
 
 One guarded LLM call (the same codex-exec path the drafter uses). Any failure
 degrades to a local heuristic; classification NEVER breaks capture or sending.

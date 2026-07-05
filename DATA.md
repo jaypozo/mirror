@@ -68,22 +68,22 @@ one-line what-changed). Indexes `(action, ts)`, `(edit_kind, ts)`.
 > INTENT/BOTH edits feed the **intent** channel (`intent_notes`). A pure decision
 > change therefore never trains voice.
 
-### `projects` — per-project goal/task/stage (project-aware summaries)
+### `threads` — per-thread goal/task/stage (thread-aware summaries)
 `id` PK, `title`, `goal`, `current_task`, `stage` CHECK IN
 ('mid-step','awaiting-owner','done'), `anchors` jsonb (distinctive keywords),
 `anchor_embedding vector(384)` (for embedding pre-rank when segmenting an incoming
-message), `created_at`, `updated_at`. Maintained by `agent/projects.py`: each
-incoming message is segmented to the best-matching project (embedding pre-rank +
+message), `created_at`, `updated_at`. Maintained by `agent/threads.py`: each
+incoming message is segmented to the best-matching thread (embedding pre-rank +
 one LLM labeler that also refreshes goal/current_task/stage and produces a
-project-aware Goal/Now/Next). Index `(updated_at DESC)`.
+thread-aware Goal/Now/Next). Index `(updated_at DESC)`.
 
 ### `intent_notes` — durable decisions captured from INTENT/BOTH edits
-`id` PK, `project_id` → `projects(id)` ON DELETE SET NULL, `feedback_id` →
+`id` PK, `thread_id` → `threads(id)` ON DELETE SET NULL, `feedback_id` →
 `feedback(id)` ON DELETE SET NULL, `note` (what the owner actually decided),
 `source_chat_id`/`source_message_id`, `ts`. Written in the `/decide` edit path
-when `edit_kind IN ('intent','both')`. Recent notes for the matched project are
-injected into the draft prompt + the project state update, so future
-goal-summaries and drafts honor real decisions. Index `(project_id, ts DESC)`.
+when `edit_kind IN ('intent','both')`. Recent notes for the matched thread are
+injected into the draft prompt + the thread state update, so future
+goal-summaries and drafts honor real decisions. Index `(thread_id, ts DESC)`.
 
 ### `style_sheet` — the living, distilled "how the owner writes" guide
 `id` PK, `guide_md` (the active markdown style guide injected into every draft),
@@ -169,10 +169,10 @@ replied to. No distance threshold — it takes the top-K nearest. Fully local.
 1. Query = the incoming message (+ a tail of the last 3 thread messages as extra
    semantic anchor).
 2. `retrieve_examples()` → top-K owner replies + their context.
-3. When summaries are enabled, **project-aware state** (`agent/projects.py`):
-   segment the message to its project, refresh goal/current_task/stage, and use
-   that project-aware Goal/Now/Next as the summary (this LLM call replaces the flat
-   `summarize_thread` call, not adds to it). The matched project's state + recent
+3. When summaries are enabled, **thread-aware state** (`agent/threads.py`):
+   segment the message to its thread, refresh goal/current_task/stage, and use
+   that thread-aware Goal/Now/Next as the summary (this LLM call replaces the flat
+   `summarize_thread` call, not adds to it). The matched thread's state + recent
    intent notes are injected into the draft prompt. Falls back to the flat
    `agent/summarize.py` summary if segmentation fails. An agent-supplied summary is
    still honored.
@@ -215,14 +215,14 @@ the model summary is the fallback.
 - **`agent/edit_classify.py`** — DUAL learning: `classify_edit(original, final)`
   → `(kind, note)` via one guarded LLM call, heuristic fallback; classifies each
   edit as `style|intent|both|trivial` so learning routes to the right channel.
-- **`agent/projects.py`** — project segmentation + per-project state:
-  `resolve_project(incoming, thread)` segments a message to a project (embedding
-  pre-rank + LLM labeler), updates its goal/task/stage, returns a project-aware
+- **`agent/threads.py`** — thread segmentation + per-thread state:
+  `resolve_thread(incoming, thread)` segments a message to a thread (embedding
+  pre-rank + LLM labeler), updates its goal/task/stage, returns a thread-aware
   summary + recent intent notes; `record_intent_note(...)` persists a decision.
   Fully guarded — returns None on failure so drafting falls back to the flat
   summary.
 - **`agent/types.py`** — shared frozen dataclasses: `ChatMessage`,
-  `ThreadSummary`, `DraftRequest`, `DraftResult` (now carries `project_id`).
+  `ThreadSummary`, `DraftRequest`, `DraftResult` (now carries `thread_id`).
 
 ---
 
@@ -245,7 +245,7 @@ Endpoints:
   sends nothing. All three write a `feedback` row. On `edit`, after the send
   succeeds, a guarded `classify_edit` sets `edit_kind`/`edit_note`; an
   `intent`/`both` edit also writes an `intent_notes` row against the draft's
-  matched project (`DraftResult.project_id`). Classification/DB failures are
+  matched thread (`DraftResult.thread_id`). Classification/DB failures are
   swallowed — never fail the request.
 - **GET `/health`** — `{ok, session_owner, pending}`.
 

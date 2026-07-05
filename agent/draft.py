@@ -17,7 +17,7 @@ import sys
 
 from agent.feedback import EditCorrection, fetch_recent_edits
 from agent.llm import LLMClient, build_llm_client
-from agent.projects import ProjectContext, resolve_project
+from agent.threads import ThreadContext, resolve_thread
 from agent.retrieve import RetrievedExample, retrieve_examples
 from agent.style_sheet import get_active_style_sheet
 from agent.summarize import summarize_thread
@@ -102,27 +102,27 @@ def format_style_sheet(style_sheet: str) -> str:
     )
 
 
-async def _resolve_project(request: DraftRequest) -> ProjectContext | None:
-    """Segment the incoming message to a project and refresh its state. Guarded:
+async def _resolve_thread(request: DraftRequest) -> ThreadContext | None:
+    """Segment the incoming message to a thread and refresh its state. Guarded:
     any failure yields None so drafting falls back to the flat summary."""
     try:
-        return await resolve_project(request.incoming_message, request.thread)
+        return await resolve_thread(request.incoming_message, request.thread)
     except Exception as exc:
-        print(f"[draft] project segmentation failed (ignored): {exc}", file=sys.stderr)
+        print(f"[draft] thread segmentation failed (ignored): {exc}", file=sys.stderr)
         return None
 
 
-def format_project(context: ProjectContext | None) -> str:
-    """Render the matched project's state + recent decisions as a prompt block so
+def format_thread_context(context: ThreadContext | None) -> str:
+    """Render the matched thread's state + recent decisions as a prompt block so
     the draft understands the high-level objective and where in the task we are.
-    Empty when there's no matched project."""
+    Empty when there's no matched thread."""
     if context is None:
         return ""
     state = context.state
     lines = [
-        "\nThe message belongs to this ongoing project — draft with its objective "
+        "\nThe message belongs to this ongoing thread — draft with its objective "
         "and current stage in mind:",
-        f"- Project: {state.title}",
+        f"- Thread: {state.title}",
     ]
     if state.goal:
         lines.append(f"- Goal: {state.goal}")
@@ -168,19 +168,19 @@ async def draft_reply(
     # writes (primary signal = their whole corpus, refined by edits).
     style_sheet = await _load_style_sheet()
 
-    # Project-aware state (Build 2). When summaries are enabled we segment the
-    # message to the owner's matching project, refresh its goal/current_task/stage,
+    # Thread-aware state (Build 2). When summaries are enabled we segment the
+    # message to the owner's matching thread, refresh its goal/current_task/stage,
     # and use that as the Goal/Now/Next summary — replacing the flat window
     # summarize call (so it's the same cost, not an extra one). The matched
-    # project's recent decisions (intent notes) are injected into the draft. An
+    # thread's recent decisions (intent notes) are injected into the draft. An
     # agent-supplied summary is still honored. Falls back to the flat summary if
     # segmentation is off or fails.
     resolved_summary = summary
-    project_context: ProjectContext | None = None
+    thread_context: ThreadContext | None = None
     if include_summary:
-        project_context = await _resolve_project(request)
-        if project_context is not None and resolved_summary is None:
-            resolved_summary = project_context.state.to_thread_summary()
+        thread_context = await _resolve_thread(request)
+        if thread_context is not None and resolved_summary is None:
+            resolved_summary = thread_context.state.to_thread_summary()
         if resolved_summary is None and request.thread:
             resolved_summary = await summarize_thread(request.thread)
 
@@ -195,9 +195,9 @@ async def draft_reply(
 
     corrections_block = format_corrections(corrections)
     style_block = format_style_sheet(style_sheet)
-    project_block = format_project(project_context)
+    thread_context_block = format_thread_context(thread_context)
 
-    user_prompt = f"""{style_block}{project_block}Here are real examples of how the owner replies:
+    user_prompt = f"""{style_block}{thread_context_block}Here are real examples of how the owner replies:
 
 {format_examples(examples)}
 {corrections_block}{thread_block}{summary_block}
@@ -223,7 +223,7 @@ Reply as the owner. Output only the reply text."""
         draft=draft,
         summary=resolved_summary or ThreadSummary.empty(),
         style_examples=[ex.reply_text for ex in examples],
-        project_id=project_context.state.id if project_context else None,
+        thread_id=thread_context.state.id if thread_context else None,
     )
 
 
