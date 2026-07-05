@@ -59,6 +59,22 @@ message being answered), `target_chat_id`/`target_thread_id` (where the reply
 went), `summary` jsonb (the Goal/Now/Next/Open snapshot), `metadata` jsonb.
 Index `(action, ts)`.
 
+### `style_sheet` — the living, distilled "how the owner writes" guide
+`id` PK, `guide_md` (the active markdown style guide injected into every draft),
+`rubric` jsonb (the measured stylometric profile it was scored against),
+`sample_size`, `active` bool (the newest `active` row is what the drafter uses),
+`model`, `generated_at`. Regenerated periodically by `agent/style_sheet.py`
+PRIMARILY from the owner's own corpus (`direction='out'`) and refined by edits.
+Index `(active, generated_at DESC)`.
+
+### `style_rules` — candidate correction rules mined from edits (anti-overfit staging)
+`id` PK, `rule_key` UNIQUE (normalized dedupe key), `rule_text`, `status` CHECK IN
+('candidate','active','decayed'), `support_edit_ids` bigint[] (the distinct
+`feedback.id` edits backing the rule), `support_count`, `misses`, `first_seen`,
+`last_seen`. A rule graduates to `active` only after ≥ `STYLE_RULE_PROMOTE_THRESHOLD`
+(default 3) independent edits support it; one-offs stay `candidate`; promoted
+rules that stop recurring accrue `misses` and `decay` out. Index `(status)`.
+
 ---
 
 ## 2. Ingest pipeline (`ingest/`)

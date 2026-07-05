@@ -67,3 +67,43 @@ CREATE TABLE IF NOT EXISTS feedback (
 
 CREATE INDEX IF NOT EXISTS feedback_action_ts_idx
     ON feedback (action, ts);
+
+-- Living style sheet: a distilled "how the owner writes" guide, regenerated
+-- periodically (agent/style_sheet.py) PRIMARILY from the owner's own message
+-- corpus (direction='out') and refined by the edit-feedback loop. The newest
+-- row with active=true is what the drafter injects into every draft. `rubric`
+-- stores the measured stylometric profile the guide was scored against.
+CREATE TABLE IF NOT EXISTS style_sheet (
+    id bigserial PRIMARY KEY,
+    guide_md text NOT NULL,
+    rubric jsonb NOT NULL DEFAULT '{}'::jsonb,
+    sample_size integer NOT NULL DEFAULT 0,
+    active boolean NOT NULL DEFAULT true,
+    model text,
+    generated_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS style_sheet_active_idx
+    ON style_sheet (active, generated_at DESC);
+
+-- Candidate style rules mined from the owner's edits. Anti-overfit staging: a
+-- rule only graduates (status='active') once it is supported by
+-- >= STYLE_RULE_PROMOTE_THRESHOLD (default 3) INDEPENDENT edits — support is the
+-- distinct set of feedback.id values in `support_edit_ids`. One-offs stay
+-- 'candidate'; promoted rules that stop recurring across regenerations accrue
+-- `misses` and decay back out (status='decayed') after STYLE_RULE_DECAY_MISSES.
+CREATE TABLE IF NOT EXISTS style_rules (
+    id bigserial PRIMARY KEY,
+    rule_key text UNIQUE NOT NULL,
+    rule_text text NOT NULL,
+    status text NOT NULL DEFAULT 'candidate'
+        CHECK (status IN ('candidate', 'active', 'decayed')),
+    support_edit_ids bigint[] NOT NULL DEFAULT '{}',
+    support_count integer NOT NULL DEFAULT 0,
+    misses integer NOT NULL DEFAULT 0,
+    first_seen timestamptz NOT NULL DEFAULT now(),
+    last_seen timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS style_rules_status_idx
+    ON style_rules (status);

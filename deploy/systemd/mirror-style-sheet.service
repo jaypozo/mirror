@@ -1,0 +1,20 @@
+# Regenerate the living style sheet (agent/style_sheet.py) from the corpus +
+# edits. This is a periodic, read-mostly refresh — it does NOT own the Telethon
+# session and must never send anything. Paired with mirror-style-sheet.timer.
+#
+# Install (optional; not enabled by this repo):
+#   sudo cp deploy/systemd/mirror-style-sheet.* /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now mirror-style-sheet.timer
+[Unit]
+Description=Mirror — regenerate the owner's living style sheet from the corpus + edits
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=tawan
+Environment=HOME=/home/tawan
+Environment=PYTHONUNBUFFERED=1
+WorkingDirectory=/home/tawan/work/mirror/feat/phase1-corpus
+ExecStart=/home/tawan/work/mirror/feat/phase1-corpus/.venv/bin/python -m agent.style_sheet

@@ -1,279 +1,238 @@
-# Mirror PRD
+# Mirror PRD — Voice & Style Mimicry
 
 ## Summary
 
-Mirror is a learning model of the owner. It starts by building a private corpus from the owner's Telegram history and now includes the draft-approval structure that helps the owner reply in their own style without sending anything automatically.
+Mirror is a private, self-hosted "learning model of the owner." It ingests the
+owner's own message history, and when a new message arrives it drafts a reply in
+the owner's voice for a human **Approve / Edit / Dismiss** decision. Nothing is
+ever sent automatically.
 
-Phase 1 builds the corpus foundation on the owner's VPS:
+This document is the product spec for the **voice/style-mimicry capability**: the
+mechanisms by which Mirror's drafts come to read as if the owner wrote them, and
+the feedback loop that keeps closing the gap.
 
-- Telegram history ingestion through the owner's user account with Telethon.
-- Postgres storage for messages and sync cursors.
-- pgvector storage for message embeddings tagged by context.
-- A skeleton embedding pipeline with a pluggable provider interface.
+## Goal
 
-Phase 2 is structurally implemented around live-thread summaries, draft generation, Telegram approval buttons, and feedback capture. It has explicit seams for the message-source integration and Telegram bot runtime configuration.
+Draft replies **indistinguishable from how the owner writes**, and keep improving
+from the owner's own edits. Success is when the owner approves a draft unchanged,
+because it already sounds like them — length, cadence, punctuation, directness,
+and all.
 
-## Vision
-
-Mirror should learn how the owner thinks, writes, prioritizes, and responds. The long-term product is a private digital twin that drafts responses for the owner to approve, edit, or dismiss. It should use the owner's own historical messages as ground truth and continue learning from every approval and edit.
-
-When a message arrives that needs the owner's reply, a mirror agent will pull the thread and work context, retrieve the owner's relevant past responses using RAG over a vector store, tag the context as code-review, planning, CS, personal, or another useful category, and draft a reply as the owner. It will post the draft to the owner's Telegram with `Approve & Send`, `Edit`, and `Dismiss` buttons plus a `Goal / Now / Next / Open` context summary, mirroring Naveed's Shade bot UI. Approve sends the reply onward. Edit and Dismiss are captured. Every approval and edit feeds back into the corpus and a running style profile so Mirror improves over time.
-
-## Goals
-
-- Build a reliable, private Telegram corpus pipeline.
-- Keep ingestion incremental, rate-limit-safe, and resumable.
-- Store enough metadata to support later retrieval, filtering, and context-aware drafting.
-- Make setup clear enough that `make pull` works after the owner fills `.env` and completes Telethon login.
-- Avoid secrets in git.
-- Keep all sending gated behind the owner's approval.
+The owner's **full historical message corpus is the primary signal**. Their
+edits are a refinement layer on top. The model is a stateless, closed-weight LLM
+(GPT-5.5 via `codex exec`), so every technique here is prompt-time and data-time,
+not weight-time.
 
 ## Non-goals
 
-- No automatic sending of Telegram replies.
-- No hosted UI.
-- No fine-tuning job.
-- No production observability stack.
-- No bot-token ingestion path.
+- No automatic sending. Every outbound reply is gated behind an explicit human
+  Approve; Edit and Dismiss are equally first-class.
+- No fine-tuning of the drafting model in this phase (the model is closed-weight;
+  see [Roadmap](#roadmap--priorities)).
+- No hosted UI; the approval card renders in the owner's own Telegram.
 
-## Users
+## What "style" decomposes into (the rubric)
 
-Primary user: the owner.
+Style is measurable. Stylometry — the quantitative study of writing style — shows
+that authorship is captured by **content-independent** features: function-word
+rates, punctuation, and sentence-length variance, not topic words
+([StyleDistance, arXiv:2410.12757](https://arxiv.org/abs/2410.12757); classic
+stylometry / function-word authorship attribution, e.g. Mosteller & Wallace on
+the Federalist Papers). Mirror scores every candidate style sheet against this
+rubric (`agent/style_sheet.py::compute_stylometry`):
 
-Operator: the owner or an authorized builder on the owner's VPS.
-
-## Phase Plan
-
-### Phase 1: corpus foundation
-
-Deliverables:
-
-- `PRD.md` and `README.md`.
-- Telethon puller at `ingest/pull.py`.
-- Postgres + pgvector schema at `db/schema.sql`.
-- Embedding pipeline skeleton at `ingest/embed.py`.
-- `.env.example`, `requirements.txt`, and `Makefile`.
-- Phase 2 stub under `agent/`.
-
-Acceptance criteria:
-
-- The schema applies cleanly to Postgres with pgvector installed.
-- `make pull` starts the Telethon user-account login flow when credentials are configured.
-- Pulls are incremental using a durable per-chat cursor.
-- Re-running the puller does not duplicate messages.
-- Interruption is safe: already flushed messages and cursor updates persist.
-- `make embed` processes unembedded text messages through a provider interface.
-- No secrets or session files are committed.
-
-### Phase 2: mirror agent
-
-Deliverables:
-
-- Message triage for "needs the owner reply".
-- Context gatherer for thread, work state, and active goals.
-- Retrieval over `message_embeddings` filtered by context tags.
-- Draft generation in the owner's voice.
-- Telegram approval UI with `Approve & Send`, `Edit`, `Dismiss`.
-- `Goal / Now / Next / Open` summary in the draft card.
-- Feedback capture from approves, edits, and dismissals.
-- Running style profile updated from accepted or edited drafts.
-
-Current scope:
-
-- Implement the summary, draft, approval, and feedback modules.
-- Degrade gracefully when the corpus is empty or pgvector retrieval is unavailable.
-- Keep message-source integration as a JSON/API seam.
-- Require `TELEGRAM_BOT_TOKEN` before running the approval bot.
+- **Message length distribution** — mean/median/p10/p90 characters and words.
+- **Sentence length + variance** — mean and standard deviation of words per
+  sentence. Humans vary; uniform sentence length reads as machine.
+- **Fragments vs. full sentences** — share of messages with no terminal
+  punctuation.
+- **Punctuation habits** — rate per 1k chars of em-dash, ellipsis, exclamation,
+  question, comma. (Em-dash usage is called out explicitly; over-use of em-dashes
+  is a common tell of machine text.)
+- **Capitalization / casing** — lowercase-start share, all-lowercase share.
+- **Contractions** — rate per 1k words.
+- **Openings / closings / sign-offs** — most common first and last tokens.
+- **Directness vs. hedging (BLUF)** — does the writer lead with the point?
+- **Formatting** — bullets, line breaks, pasted logs.
+- **Emoji usage** — emoji per message.
+- **Signature phrases / tics** — recurrent bigrams and trigrams.
+- **Function-word tendencies** — rate of closed-class words (the strongest,
+  most content-independent authorship fingerprint).
 
 ## Architecture
 
-```text
-Telegram user account
-        |
-        | Telethon, persisted session
-        v
-ingest/pull.py
-        |
-        | upsert messages + update sync_state
-        v
-Postgres
-  - messages
-  - sync_state
-  - message_embeddings
-        ^
-        | provider interface
-        |
-ingest/embed.py
+```
+Telegram (owner's USER account)
+        │  Telethon USER session — sanctioned self-read
+        ▼
+ingest ──► Postgres + pgvector  = the PRIMARY signal (owner's FULL history)
+        │       │
+        │       ├── local sentence-transformers embeddings (384-dim, on-box)
+        │       ▼
+        │   message_embeddings (pgvector)
+        │       │
+incoming msg ───┤  retrieve top-K of the owner's own past replies (direction='out')
+        │       ▼
+        │   draft prompt  =  [living style sheet]
+        │                  + [retrieved few-shot exemplars]
+        │                  + [recent edit corrections]
+        │       ▼
+        │   stateless LLM draft (GPT-5.5 via codex exec)
+        │       ▼
+        │   Approve / Edit / Dismiss  ──► feedback table
+        │                                     │
+        └─────────────────────────────────────┘  edits refine the style sheet
 ```
 
-Phase 2 adds:
+Everything runs on-box with no third-party API key: local embeddings, and
+drafting through `codex exec` (ChatGPT OAuth). The corpus never leaves the
+machine for a hosted embedding or chat API.
 
-```text
-Incoming message -> context builder -> RAG retrieval -> draft generator
-       -> Telegram approval card -> send/edit/dismiss feedback -> corpus/style profile
-```
+### The corpus is the primary signal
 
-Implemented Phase 2 modules:
+The owner's full outbound history (`direction='out'`) is ground truth for their
+voice. The living style sheet is built primarily by sampling and measuring that
+corpus; the retrieval layer surfaces real past replies as few-shot examples;
+edits are a *refinement* layer, valuable but secondary in volume.
 
-```text
-source payload -> agent.summarize -> agent.draft
-       -> agent.bot approval card -> agent.feedback
-```
+### The living style sheet (`agent/style_sheet.py`)
 
-## Data Model
+A distilled, always-injected "how the owner writes" guide, persisted in Postgres
+and regenerated periodically (not per-draft). Generation is **one LLM call** that
+turns (a) the measured stylometric profile over a corpus sample, (b) a sample of
+real messages, and (c) accumulated edits, into a short markdown style guide plus
+candidate correction rules. The active guide is injected into every draft
+alongside the exemplars and edit corrections; a missing or failed sheet degrades
+gracefully (drafting still works).
 
-### messages
+This is the **Author Writing Sheet** technique from
+[ACL 2024.personalize-1.6 (Learning to Generate Text in Arbitrary Writing
+Styles)](https://aclanthology.org/2024.personalize-1.6/): a compact,
+human-readable author descriptor that conditions generation and generalizes
+better than raw exemplars alone.
 
-Telegram message records, keyed by `(chat_id, id)` because Telegram message IDs are scoped to each chat.
+#### Staged rule promotion (anti-overfit)
 
-Columns:
+A single edit is noise; a *pattern* of edits is signal. To avoid over-fitting to
+one-off corrections, rules mined from edits are staged in `style_rules`:
 
-- `id bigint`: Telegram message id within the chat.
-- `chat_id bigint`: Telethon dialog id.
-- `chat_title text`: current known chat title.
-- `sender_id bigint`: Telegram sender id when available.
-- `sender_name text`: best-effort display name.
-- `text text`: message text or caption.
-- `ts timestamptz`: message timestamp.
-- `direction text`: `in` or `out`.
-- `reply_to_id bigint`: message id replied to, when available.
-- `raw jsonb`: selected raw Telethon payload for future backfills.
+- A candidate rule graduates into the **active** guide only after it is supported
+  by **≥ `STYLE_RULE_PROMOTE_THRESHOLD` (default 3) independent edits** — support
+  is the distinct set of `feedback.id` values backing it.
+- One-offs stay as `candidate` and never reach the drafter.
+- Promoted rules that stop recurring across regenerations accrue `misses` and
+  **decay** back out (`status='decayed'`) after `STYLE_RULE_DECAY_MISSES`.
 
-Indexes:
+Regenerate on demand with `python -m agent.style_sheet`; schedule a periodic
+refresh with the units in `deploy/systemd/` (a daily timer is provided but not
+installed by the repo).
 
-- `(chat_id, ts)` for chronological thread reconstruction.
-- `(direction, ts)` for outbound style retrieval.
+### The edit-feedback loop (`agent/feedback.py`, `agent/draft.py`)
 
-### sync_state
+Every Approve / Edit / Dismiss decision is written to `feedback`. Edits are the
+strongest single learning signal: the delta between what Mirror drafted and what
+the owner actually sent is a direct correction. `fetch_recent_edits` injects
+recent edits as few-shot corrections into the draft prompt, ranked by **both
+recency and edit magnitude** (a bigger rewrite, measured by normalized edit
+distance, outranks a one-word tweak) and **capped** so corrections never crowd
+out the exemplars or the style sheet. This "learn from edits / fine-grained
+feedback" approach follows
+[arXiv:2512.23693 (fine-grained feedback / edit pairs)](https://arxiv.org/abs/2512.23693)
+and the personalization-from-history framing of
+[arXiv:2308.07968 (Teach LLMs to Personalize)](https://arxiv.org/abs/2308.07968).
 
-Per-chat ingestion cursor.
+## Techniques (ranked for a stateless, closed-weight setup)
 
-Columns:
+Recent work shows LLMs can imitate a target style from **very few examples** when
+those examples are well chosen — few-shot style imitation lifts style match by a
+large margin ([arXiv:2509.24930, "few-shot 23×"](https://arxiv.org/abs/2509.24930)),
+and style is detectable/attributable enough that content-independent
+representations matter ([arXiv:2509.14543, "Catch Me If You Can"](https://arxiv.org/abs/2509.14543)).
+Ranked by fit for Mirror's stateless `codex exec` drafter:
 
-- `chat_id bigint primary key`
-- `chat_title text`
-- `last_message_id bigint`
-- `last_pulled_at timestamptz`
+- **(A) Style-selected few-shot exemplars** — 2–5 of the owner's real past
+  replies as in-context examples. Biggest lift for least cost. **Shipped**
+  (retrieval → few-shot).
+- **(B) Persistent distilled style card / "Author Writing Sheet"** — the living
+  style sheet. **Shipped.**
+- **(C) Learn-from-edits few-shot corrections** — recent edits as explicit
+  drafted-vs-sent corrections. **Shipped** (recency + magnitude weighted).
+- **(D) Style-embedding retrieval** — select exemplars by *style* similarity, not
+  topic similarity. **Next.** (See the key insight below.)
+- **(E) Retrieve → rank → summarize → synthesize** — a multi-stage pipeline that
+  summarizes retrieved context before drafting ([arXiv:2308.07968](https://arxiv.org/abs/2308.07968)).
+  Partially present (optional thread summary); expand later.
+- **(F) Fine-tuning / LoRA** — poor fit now: the drafting model is closed-weight,
+  so we cannot own or update its weights.
+- **(G) DPO / ORPO from approve-vs-edit preference pairs** — future. Approve
+  (chosen) vs. the draft that was edited (rejected) are natural preference pairs
+  ([DPO, arXiv:2305.18290](https://arxiv.org/abs/2305.18290)). Needs owned
+  weights, so we **bank G-ready preference rows now** (the `feedback` table
+  already stores original draft vs. final text) and apply them once an
+  open-weight drafting path exists.
 
-### message_embeddings
+**Recommendation implemented: A + B + C now; D next; bank G-ready pairs for
+later.**
 
-Vector rows for retrieval.
+### Key insight: semantic ≠ stylistic similarity
 
-Columns:
+The retrieval layer currently uses semantic embeddings (`all-MiniLM-L6-v2`),
+which retrieve **topic-similar** exemplars — good for relevance, but not
+guaranteed to be **style-similar**. Style similarity needs **content-independent**
+representations such as StyleDistance / LUAR
+([arXiv:2410.12757](https://arxiv.org/abs/2410.12757)). Technique (D) adds a
+style-embedding index so exemplar selection optimizes for *how* the owner wrote,
+independently of topic. The living style sheet (B) already compensates by
+injecting content-independent style features directly, but style-based retrieval
+is the principled next step.
 
-- `chat_id bigint`
-- `message_id bigint`
-- `embedding vector`
-- `context_tag text`
-- `provider text`
-- `model text`
-- `embedded_at timestamptz`
+## Eval / scoreboard
 
-The foreign key is `(chat_id, message_id)` to `messages(chat_id, id)`.
+Style is measurable, so mimicry quality is measurable:
 
-### feedback
+- **Approve-without-edit rate** — the primary product metric. Rising = drafts
+  land as-is more often.
+- **Edit distance draft→final** — normalized edit distance on the edits that do
+  happen; should trend down as the style sheet and corrections improve.
+- **Style-embedding cosine** vs. held-out real owner messages — content-independent
+  style similarity of drafts to genuine messages.
+- **Blind impersonation test** — periodic human check: can the owner tell their
+  own message from a Mirror draft?
 
-Draft approval feedback used as a learning signal.
+All four are computable from the `feedback` table plus a held-out slice of the
+corpus.
 
-Columns:
+## Roadmap / priorities
 
-- `original_draft text`
-- `final_text text`
-- `action text`: `approve`, `edit`, or `dismiss`
-- `ts timestamptz`
-- source and target chat metadata
-- `summary jsonb`
-- `metadata jsonb`
+1. **Edit-feedback loop** — recency+magnitude-weighted, capped. **Shipped.**
+2. **Living style sheet** with staged rule promotion + decay. **Shipped.**
+3. **Style-based retrieval (D)** — add a style-embedding index; select exemplars
+   by style, not topic.
+4. **Scoreboard** — persist the four eval metrics and surface a trend.
+5. **Preference-pair banking (G-ready)** — the `feedback` schema already captures
+   chosen/rejected pairs; formalize export for a future DPO/ORPO run once an
+   open-weight drafting path exists.
 
-## Context Tagging
+## Security & privacy
 
-Phase 1 uses a heuristic stub:
+- Reading the owner's own history via a Telethon **USER** session is the
+  sanctioned path for accessing one's own data. The corpus stays private and
+  on-box.
+- Nothing is sent without an explicit human Approve/Edit.
+- No secrets in git: `.env`, the Telethon session, and DB dumps are gitignored.
+  This document and the code refer only to "the owner"/"the user" and contain no
+  personal identifiers or secret values.
+- Fully local embeddings and on-box drafting mean the corpus never leaves the
+  machine for a hosted API.
 
-- `code-review`: review, diff, PR, tests, bug, stack trace, deploy.
-- `planning`: roadmap, plan, milestone, goal, next, timeline.
-- `cs`: customer, client, support, refund, invoice, onboarding.
-- `personal`: family, dinner, travel, home, birthday, weekend.
-- `general`: fallback.
+## References
 
-The tagger should be replaced later by a classifier or agent pass once enough data is available.
-
-## Security and Privacy
-
-- The puller uses the owner's Telegram user account through Telethon.
-- It must never accept or use a Telegram bot token for history ingestion.
-- `.env`, Telethon session files, and local database dumps stay off git.
-- The corpus remains in the owner's private repo and VPS database.
-- Raw message JSON is stored for recoverability, so database access must be treated as sensitive.
-
-## Setup Requirements
-
-Required environment:
-
-- Python 3.11+
-- Postgres with pgvector installed.
-- `TELEGRAM_API_ID` and `TELEGRAM_API_HASH` from <https://my.telegram.org>.
-- A writable Telethon session file path.
-- `DATABASE_URL`.
-- Embedding provider credentials when embeddings are run.
-
-## Operational Behavior
-
-`ingest/pull.py`:
-
-- Loads `.env`.
-- Requires user-account Telegram API credentials.
-- Starts Telethon and performs one-time login if no session exists.
-- Iterates dialogs.
-- Reads `sync_state.last_message_id` per chat.
-- Fetches messages with `min_id=last_message_id` in chronological order.
-- Upserts messages.
-- Advances the cursor after each flushed batch.
-- Sleeps gently between batches and dialogs.
-- Handles `FloodWait` explicitly while also relying on Telethon's built-in handling.
-
-`ingest/embed.py`:
-
-- Loads `.env`.
-- Selects text messages without embeddings.
-- Applies a heuristic context tag.
-- Calls an embedding provider interface.
-- Inserts vectors into `message_embeddings`.
-
-`agent/summarize.py`:
-
-- Accepts recent live-thread messages.
-- Produces `Goal / Now / Next / Open`.
-- Uses a pluggable LLM client when configured.
-- Falls back to a heuristic summary if the LLM is unavailable.
-
-`agent/draft.py`:
-
-- Accepts incoming message, thread, and summary.
-- Retrieves owner-style examples from pgvector when available.
-- Falls back to a basic style profile when the corpus is empty.
-- Uses a pluggable LLM client to draft as the owner.
-
-`agent/bot.py`:
-
-- Runs a Telegram approval bot.
-- Posts the context summary, draft, and inline buttons.
-- On `Approve & Send`, sends the draft to the target chat.
-- On `Edit`, captures the owner's edited text and sends it onward.
-- On `Dismiss`, drops the draft.
-- Persists every action through `agent.feedback`.
-
-## Risks
-
-- Telegram limits can slow initial backfill. Mitigation: incremental batches and sleeps.
-- Message IDs are not globally unique. Mitigation: composite keys by chat.
-- Embedding provider dimensions can vary. Mitigation: schema uses pgvector's flexible `vector` type and stores provider/model metadata.
-- Private data exposure. Mitigation: local-only default, ignored secrets/session files, clear docs.
-- Pending approval state is currently in memory. Mitigation: durable feedback is persisted; production hardening can add a pending approvals table.
-- Message-source integration is still external. Mitigation: `DraftRequest` JSON payload shape is documented.
-
-## Open Questions
-
-- Which embedding provider and model should be canonical for the owner's VPS?
-- Should Phase 2 retrieve only the owner's outbound messages by default, or blend inbound context with outbound examples?
-- What contexts beyond code-review, planning, CS, and personal matter most?
-- How long should raw message JSON be retained?
+- Catch Me If You Can — style detection/attribution: <https://arxiv.org/abs/2509.14543>
+- LLMs imitate style few-shot (23×): <https://arxiv.org/abs/2509.24930>
+- Author Writing Sheets (ACL 2024): <https://aclanthology.org/2024.personalize-1.6/>
+- Teach LLMs to Personalize: <https://arxiv.org/abs/2308.07968>
+- Fine-grained feedback / edit pairs: <https://arxiv.org/abs/2512.23693>
+- Direct Preference Optimization (DPO): <https://arxiv.org/abs/2305.18290>
+- StyleDistance — content-independent style embeddings: <https://arxiv.org/abs/2410.12757>
+- Stylometry / function-word authorship attribution (Mosteller & Wallace, *Inference
+  and Disputed Authorship: The Federalist*, 1964).

@@ -18,6 +18,7 @@ import sys
 from agent.feedback import EditCorrection, fetch_recent_edits
 from agent.llm import LLMClient, build_llm_client
 from agent.retrieve import RetrievedExample, retrieve_examples
+from agent.style_sheet import get_active_style_sheet
 from agent.summarize import summarize_thread
 from agent.types import DraftRequest, DraftResult, ThreadSummary
 
@@ -78,6 +79,28 @@ async def _load_corrections(limit: int = 8) -> list[EditCorrection]:
         return []
 
 
+async def _load_style_sheet() -> str:
+    """Fetch the active living style sheet. Guarded: any failure yields '' so a
+    missing/failed style sheet never breaks drafting."""
+    try:
+        return (await get_active_style_sheet()) or ""
+    except Exception as exc:
+        print(f"[draft] could not load style sheet (ignored): {exc}", file=sys.stderr)
+        return ""
+
+
+def format_style_sheet(style_sheet: str) -> str:
+    """Render the living style sheet as a prompt block. Empty when absent."""
+    guide = (style_sheet or "").strip()
+    if not guide:
+        return ""
+    return (
+        "\nThe owner's living style sheet (distilled from their whole message "
+        "history and refined by their edits) — follow it:\n"
+        f"{guide}\n"
+    )
+
+
 def heuristic_draft(request: DraftRequest) -> str:
     if "?" in request.incoming_message:
         return "Let me check one detail and get back to you."
@@ -107,6 +130,10 @@ async def draft_reply(
     # Learning signal: recent cases where the owner edited a draft before sending.
     corrections = await _load_corrections()
 
+    # Living style sheet: the always-injected, distilled guide to how the owner
+    # writes (primary signal = their whole corpus, refined by edits).
+    style_sheet = await _load_style_sheet()
+
     # Thread summary is optional: it costs a second codex call, so it's off by
     # default to keep drafting to one stateless exec per reply.
     resolved_summary = summary
@@ -123,8 +150,9 @@ async def draft_reply(
         summary_block = f"\nThread summary:\n{resolved_summary.format_for_telegram()}\n"
 
     corrections_block = format_corrections(corrections)
+    style_block = format_style_sheet(style_sheet)
 
-    user_prompt = f"""Here are real examples of how the owner replies:
+    user_prompt = f"""{style_block}Here are real examples of how the owner replies:
 
 {format_examples(examples)}
 {corrections_block}{thread_block}{summary_block}

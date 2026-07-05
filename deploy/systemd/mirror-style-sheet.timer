@@ -1,0 +1,15 @@
+# Run the style-sheet regeneration daily (and shortly after boot). Enable with:
+#   sudo systemctl enable --now mirror-style-sheet.timer
+# The living style sheet is refreshed periodically, not on every draft, so the
+# hot draft path stays a single stateless LLM call.
+[Unit]
+Description=Daily refresh of the Mirror living style sheet
+
+[Timer]
+OnBootSec=10min
+OnCalendar=daily
+Persistent=true
+Unit=mirror-style-sheet.service
+
+[Install]
+WantedBy=timers.target

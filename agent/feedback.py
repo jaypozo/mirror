@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import difflib
 import json
 import os
 import sys
@@ -23,9 +24,16 @@ class EditCorrection:
     summary: dict[str, Any]
 
 
-async def fetch_recent_edits(limit: int = 8) -> list[EditCorrection]:
-    """Return up to `limit` most-recent action='edit' rows (owner corrected the
-    draft before sending) as voice-correction examples for drafting.
+async def fetch_recent_edits(limit: int = 8, pool: int = 40) -> list[EditCorrection]:
+    """Return up to `limit` action='edit' rows (owner corrected the draft before
+    sending) as voice-correction examples for drafting, ranked by BOTH recency
+    and edit magnitude so the strongest, freshest corrections win.
+
+    We over-fetch the `pool` most-recent edits, then score each by a recency
+    weight (newest ranks highest, decaying by position) times an edit-magnitude
+    weight (a bigger rewrite is a stronger signal than a one-word tweak, measured
+    by normalized difflib distance). The top `limit` are returned — capped so the
+    corrections never crowd out the retrieved exemplars or the style sheet.
 
     Best-effort: any DB hiccup returns [] so drafting is never blocked. Long text
     is truncated to keep the prompt cheap.
@@ -34,6 +42,9 @@ async def fetch_recent_edits(limit: int = 8) -> list[EditCorrection]:
     database_url = os.getenv("DATABASE_URL")
     if not database_url:
         return []
+
+    limit = max(1, int(limit))
+    pool = max(limit, int(pool))
 
     def _trunc(value: str | None, cap: int = 600) -> str:
         text = (value or "").strip()
@@ -57,7 +68,7 @@ async def fetch_recent_edits(limit: int = 8) -> list[EditCorrection]:
             ORDER BY ts DESC
             LIMIT $1
             """,
-            max(1, int(limit)),
+            pool,
         )
     except Exception as exc:
         print(f"[feedback] fetch_recent_edits query failed: {exc}", file=sys.stderr)
@@ -65,22 +76,35 @@ async def fetch_recent_edits(limit: int = 8) -> list[EditCorrection]:
     finally:
         await conn.close()
 
-    corrections: list[EditCorrection] = []
-    for r in rows:
+    # Rank the candidate pool by recency (rows arrive newest-first) * magnitude.
+    scored: list[tuple[float, EditCorrection]] = []
+    for rank, r in enumerate(rows):
         summary = r["summary"]
         if isinstance(summary, str):
             try:
                 summary = json.loads(summary)
             except Exception:
                 summary = {}
-        corrections.append(
-            EditCorrection(
-                original_draft=_trunc(r["original_draft"]),
-                final_text=_trunc(r["final_text"]),
-                summary=summary if isinstance(summary, dict) else {},
+        original = r["original_draft"] or ""
+        final = r["final_text"] or ""
+        # Normalized edit distance in [0, 1]: 0 = identical, 1 = total rewrite.
+        magnitude = 1.0 - difflib.SequenceMatcher(None, original, final).ratio()
+        # Geometric recency decay; floor keeps magnitude meaningful for big edits.
+        recency = 0.85 ** rank
+        score = recency * (0.5 + magnitude)
+        scored.append(
+            (
+                score,
+                EditCorrection(
+                    original_draft=_trunc(original),
+                    final_text=_trunc(final),
+                    summary=summary if isinstance(summary, dict) else {},
+                ),
             )
         )
-    return corrections
+
+    scored.sort(key=lambda item: item[0], reverse=True)
+    return [correction for _, correction in scored[:limit]]
 
 
 async def record_feedback(
