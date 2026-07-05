@@ -96,6 +96,15 @@ class ServiceState:
 STATE: ServiceState | None = None
 SECRET: str = ""
 
+# Set once warm-up (see _warm_up) has eager-loaded every lazy heavy init the
+# draft path needs. /draft and /decide gate on this so a request that somehow
+# arrives before we're fully warm WAITS instead of running against a cold
+# pipeline. In the normal boot sequence this is a no-op guard: _warm_up() runs
+# to completion before the HTTP site ever binds, so no request can arrive
+# first — but the gate is cheap insurance against that invariant changing.
+READY = asyncio.Event()
+WARMUP_WAIT_TIMEOUT_SECONDS = 120
+
 
 # --------------------------------------------------------------------------- #
 # Helpers.
@@ -105,6 +114,72 @@ def _authorized(request: web.Request) -> bool:
         # No secret configured => refuse everything. Fail closed.
         return False
     return request.headers.get("X-Mirror-Secret") == SECRET
+
+
+def _client_gone(request: web.Request) -> bool:
+    """True if the caller's connection is already closed/closing. A slow /draft
+    can outlive the caller's own client-side request timeout (the fleet-bot
+    plugin aborts after a fixed timeout); when that happens we still finish the
+    draft but the caller never sees it — logged loudly so a "200 0" empty
+    response in the access log is never a silent mystery."""
+    transport = request.transport
+    return transport is None or transport.is_closing()
+
+
+async def _wait_until_ready(timeout: float = WARMUP_WAIT_TIMEOUT_SECONDS) -> bool:
+    if READY.is_set():
+        return True
+    log.info("request arrived before warm-up finished — waiting for readiness")
+    try:
+        await asyncio.wait_for(READY.wait(), timeout=timeout)
+        return True
+    except asyncio.TimeoutError:
+        return False
+
+
+async def _warm_up() -> None:
+    """Eager-load the embedding model (and any other lazy heavy init the draft
+    path needs) BEFORE the server starts accepting requests.
+
+    Root cause this closes: `agent.retrieve.embed_query` lazily loads the local
+    sentence-transformers encoder (all-MiniLM-L6-v2) via an lru_cache on first
+    call. Every restart used to pay that load cost (several seconds, sometimes
+    tens of seconds while huggingface_hub re-validates the local cache over the
+    network) on the FIRST real /draft after the restart — on top of the
+    drafting call's own latency. The fleet-bot caller aborts /draft after a
+    fixed client-side timeout, so that slow first draft came back to it as a
+    connection that was already closed by the time we tried to respond, logged
+    as a "200 0" empty body in the access log even though the draft itself
+    completed successfully (see `_client_gone`).
+
+    Running the SAME warm-up path drafting uses (embed_query, which populates
+    the shared encoder cache) here means the first real /draft after a restart
+    is as fast as every later one, comfortably inside the caller's timeout.
+
+    Guarded: any failure here is logged loudly but never blocks startup or
+    causes a boot-loop — a slow-but-working first draft beats a service that
+    won't come up at all.
+    """
+    start = time.monotonic()
+    try:
+        from agent.retrieve import embed_query
+
+        vec = await embed_query("warmup")
+        log.info(
+            "warm-up: embedding encoder loaded (dim=%d) in %.1fs",
+            len(vec) if vec else 0,
+            time.monotonic() - start,
+        )
+    except Exception as exc:
+        log.warning(
+            "warm-up: embedding encoder failed to preload in %.1fs (ignored — "
+            "the first /draft may be slow/cold): %s",
+            time.monotonic() - start,
+            exc,
+        )
+    finally:
+        READY.set()
+        log.info("warm-up complete")
 
 
 def _is_excluded_topic(chat_id: int, is_topic: bool) -> bool:
@@ -196,6 +271,12 @@ def _load_pending() -> None:
 async def handle_draft(request: web.Request) -> web.Response:
     if not _authorized(request):
         return web.json_response({"ok": False, "reason": "unauthorized"}, status=401)
+    if not await _wait_until_ready():
+        log.warning("handle_draft: still warming up after %.0fs, refusing", WARMUP_WAIT_TIMEOUT_SECONDS)
+        return web.json_response(
+            {"ok": False, "reason": "service still warming up, try again shortly"},
+            status=503,
+        )
     assert STATE is not None
     _sweep_expired()
 
@@ -222,7 +303,7 @@ async def handle_draft(request: web.Request) -> web.Response:
         source_chat_id=chat_id,
         source_message_id=int(question_msg_id) if question_msg_id is not None else None,
         target_chat_id=chat_id,
-        target_thread_id=None,  # reply threads to the agent's question, not a topic
+        topic_id=None,  # reply threads to the agent's question, not a topic
         metadata={
             "origin": "fleet-bot",
             "chat_id": chat_id,
@@ -248,6 +329,18 @@ async def handle_draft(request: web.Request) -> web.Response:
     _save_pending()
     log.info("drafted approval_id=%s chat=%s", approval_id, chat_id)
 
+    if _client_gone(request):
+        # The draft is real and is now pending (Approve/Edit/Dismiss still work
+        # if the caller retries), but THIS response will land on a closed
+        # socket — 0 bytes will actually reach the caller. Logged loudly so
+        # this is never mistaken for the app silently returning an empty 200.
+        log.warning(
+            "handle_draft: caller disconnected before the draft finished "
+            "(approval_id=%s) — likely their own client-side request timeout; "
+            "draft is still pending server-side, nothing is lost",
+            approval_id,
+        )
+
     return web.json_response(
         {
             "ok": True,
@@ -272,6 +365,12 @@ async def handle_draft(request: web.Request) -> web.Response:
 async def handle_decide(request: web.Request) -> web.Response:
     if not _authorized(request):
         return web.json_response({"ok": False, "reason": "unauthorized"}, status=401)
+    if not await _wait_until_ready():
+        log.warning("handle_decide: still warming up after %.0fs, refusing", WARMUP_WAIT_TIMEOUT_SECONDS)
+        return web.json_response(
+            {"ok": False, "reason": "service still warming up, try again shortly"},
+            status=503,
+        )
     assert STATE is not None
 
     try:
@@ -303,7 +402,7 @@ async def handle_decide(request: web.Request) -> web.Response:
             source_chat_id=pending.request.source_chat_id,
             source_message_id=pending.request.source_message_id,
             target_chat_id=pending.request.target_chat_id,
-            target_thread_id=pending.request.target_thread_id,
+            topic_id=pending.request.topic_id,
             summary=pending.result.summary,
             metadata=pending.request.metadata,
         )
@@ -340,7 +439,7 @@ async def handle_decide(request: web.Request) -> web.Response:
             source_chat_id=pending.request.source_chat_id,
             source_message_id=pending.request.source_message_id,
             target_chat_id=pending.request.target_chat_id,
-            target_thread_id=pending.request.target_thread_id,
+            topic_id=pending.request.topic_id,
             summary=pending.result.summary,
             metadata=pending.request.metadata,
             edit_kind=edit_kind,
@@ -485,6 +584,10 @@ async def build_and_run() -> None:
             pass
 
     async with user:
+        # Eager-load the embedding model (and any other lazy heavy init the
+        # draft path needs) BEFORE binding, so the very first /draft after this
+        # restart is never a cold, slow one. See _warm_up for why.
+        await _warm_up()
         await site.start()
         log.info("Mirror approve service listening on http://%s:%s (loopback)", host, port)
         # Optional: resume older-history backfill inside THIS user client, so the

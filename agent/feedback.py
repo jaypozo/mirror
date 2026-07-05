@@ -12,7 +12,7 @@ from typing import Any
 import asyncpg
 from dotenv import load_dotenv
 
-from agent.types import ThreadSummary
+from agent.types import Brief
 
 
 @dataclass(frozen=True)
@@ -121,8 +121,8 @@ async def record_feedback(
     source_chat_id: int | None = None,
     source_message_id: int | None = None,
     target_chat_id: int | None = None,
-    target_thread_id: int | None = None,
-    summary: ThreadSummary | None = None,
+    topic_id: int | None = None,
+    summary: Brief | None = None,
     metadata: dict[str, Any] | None = None,
     edit_kind: str | None = None,
     edit_note: str | None = None,
@@ -144,7 +144,7 @@ async def record_feedback(
             INSERT INTO feedback (
                 original_draft, final_text, action,
                 source_chat_id, source_message_id,
-                target_chat_id, target_thread_id,
+                target_chat_id, topic_id,
                 summary, metadata, edit_kind, edit_note
             )
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9::jsonb, $10, $11)
@@ -156,7 +156,7 @@ async def record_feedback(
             source_chat_id,
             source_message_id,
             target_chat_id,
-            target_thread_id,
+            topic_id,
             json.dumps(summary.to_dict() if summary else {}),
             json.dumps(metadata or {}),
             edit_kind,

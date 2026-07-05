@@ -30,7 +30,7 @@ The source integration should pass this shape to `DraftRequest.from_dict()` or t
   "source_chat_id": 123,
   "source_message_id": 456,
   "target_chat_id": 789,
-  "target_thread_id": null,
+  "topic_id": null,
   "context_tag": "code-review",
   "metadata": {"source": "live-thread"}
 }

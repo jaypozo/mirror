@@ -60,7 +60,7 @@ CREATE TABLE IF NOT EXISTS feedback (
     source_chat_id bigint,
     source_message_id bigint,
     target_chat_id bigint,
-    target_thread_id bigint,
+    topic_id bigint,
     summary jsonb NOT NULL DEFAULT '{}'::jsonb,
     metadata jsonb NOT NULL DEFAULT '{}'::jsonb
 );

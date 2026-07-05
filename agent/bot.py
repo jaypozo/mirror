@@ -68,8 +68,8 @@ async def send_to_target(bot: Any, request: DraftRequest, text: str) -> None:
     if not request.target_chat_id:
         raise RuntimeError("No target_chat_id was provided by the message-source integration.")
     kwargs: dict[str, Any] = {"chat_id": request.target_chat_id, "text": text}
-    if request.target_thread_id:
-        kwargs["message_thread_id"] = request.target_thread_id
+    if request.topic_id:
+        kwargs["message_thread_id"] = request.topic_id
     await bot.send_message(**kwargs)
 
 
@@ -137,7 +137,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 source_chat_id=pending.request.source_chat_id,
                 source_message_id=pending.request.source_message_id,
                 target_chat_id=pending.request.target_chat_id,
-                target_thread_id=pending.request.target_thread_id,
+                topic_id=pending.request.topic_id,
                 summary=pending.result.summary,
                 metadata=pending.request.metadata,
             )
@@ -163,7 +163,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             source_chat_id=pending.request.source_chat_id,
             source_message_id=pending.request.source_message_id,
             target_chat_id=pending.request.target_chat_id,
-            target_thread_id=pending.request.target_thread_id,
+            topic_id=pending.request.topic_id,
             summary=pending.result.summary,
             metadata=pending.request.metadata,
         )
@@ -197,7 +197,7 @@ async def handle_edit_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         source_chat_id=pending.request.source_chat_id,
         source_message_id=pending.request.source_message_id,
         target_chat_id=pending.request.target_chat_id,
-        target_thread_id=pending.request.target_thread_id,
+        topic_id=pending.request.topic_id,
         summary=pending.result.summary,
         metadata=pending.request.metadata,
     )

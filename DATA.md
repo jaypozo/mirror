@@ -55,7 +55,7 @@ means changing the dim and re-embedding (the table must be empty to ALTER it).
 ### `feedback` — every Approve / Edit / Dismiss decision (the learning signal)
 `id` PK, `original_draft`, `final_text` (null on dismiss), `action` CHECK IN
 ('approve','edit','dismiss'), `ts`, `source_chat_id`/`source_message_id` (the
-message being answered), `target_chat_id`/`target_thread_id` (where the reply
+message being answered), `target_chat_id`/`topic_id` (where the reply
 went), `summary` jsonb (the Goal/Now/Next/Open snapshot), `metadata` jsonb,
 `edit_kind` CHECK IN ('style','intent','both','trivial') (**DUAL learning** — set
 at capture in the `/decide` edit path by a guarded LLM comparing `original_draft`
@@ -222,7 +222,7 @@ the model summary is the fallback.
   Fully guarded — returns None on failure so drafting falls back to the flat
   summary.
 - **`agent/types.py`** — shared frozen dataclasses: `ChatMessage`,
-  `ThreadSummary`, `DraftRequest`, `DraftResult` (now carries `thread_id`).
+  `Brief`, `DraftRequest`, `DraftResult` (now carries `thread_id`).
 
 ---
 

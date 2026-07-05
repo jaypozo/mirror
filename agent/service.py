@@ -182,7 +182,7 @@ async def on_incoming(event) -> None:
         source_chat_id=int(event.chat_id),
         source_message_id=int(event.message.id) if event.message.id is not None else None,
         target_chat_id=int(event.chat_id),
-        target_thread_id=None,  # we reply to the original message, not a topic
+        topic_id=None,  # we reply to the original message, not a topic
         metadata={"reason": decision.reason},
     )
 
@@ -246,7 +246,7 @@ async def _log_feedback(pending: Pending, *, action: str, final: str | None) -> 
         source_chat_id=pending.request.source_chat_id,
         source_message_id=pending.request.source_message_id,
         target_chat_id=pending.request.target_chat_id,
-        target_thread_id=pending.request.target_thread_id,
+        topic_id=pending.request.topic_id,
         summary=pending.result.summary,
         metadata=pending.request.metadata,
     )

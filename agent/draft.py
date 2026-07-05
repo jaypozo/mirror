@@ -21,7 +21,7 @@ from agent.threads import ThreadContext, resolve_thread
 from agent.retrieve import RetrievedExample, retrieve_examples
 from agent.style_sheet import get_active_style_sheet
 from agent.summarize import summarize_thread
-from agent.types import DraftRequest, DraftResult, ThreadSummary
+from agent.types import Brief, DraftRequest, DraftResult
 
 
 DRAFT_SYSTEM_PROMPT = """You are drafting the owner's reply to an incoming Telegram message, in their voice and style.
@@ -143,7 +143,7 @@ def heuristic_draft(request: DraftRequest) -> str:
 
 async def draft_reply(
     request: DraftRequest,
-    summary: ThreadSummary | None = None,
+    summary: Brief | None = None,
     llm: LLMClient | None = None,
     top_k: int | None = None,
     include_summary: bool = False,
@@ -221,7 +221,7 @@ Reply as the owner. Output only the reply text."""
     draft = response.strip() or heuristic_draft(request)
     return DraftResult(
         draft=draft,
-        summary=resolved_summary or ThreadSummary.empty(),
+        summary=resolved_summary or Brief.empty(),
         style_examples=[ex.reply_text for ex in examples],
         thread_id=thread_context.state.id if thread_context else None,
     )

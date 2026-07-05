@@ -37,14 +37,14 @@ class ChatMessage:
 
 
 @dataclass(frozen=True)
-class ThreadSummary:
+class Brief:
     goal: str
     now: str
     next: str
     open: list[str] = field(default_factory=list)
 
     @classmethod
-    def empty(cls) -> "ThreadSummary":
+    def empty(cls) -> "Brief":
         return cls(
             goal="Understand what this thread is trying to resolve.",
             now="A reply may be needed.",
@@ -53,7 +53,7 @@ class ThreadSummary:
         )
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "ThreadSummary":
+    def from_dict(cls, data: dict[str, Any]) -> "Brief":
         open_items = data.get("open", [])
         if isinstance(open_items, str):
             open_items = [open_items]
@@ -89,7 +89,7 @@ class DraftRequest:
     source_chat_id: int | None = None
     source_message_id: int | None = None
     target_chat_id: int | None = None
-    target_thread_id: int | None = None
+    topic_id: int | None = None
     context_tag: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
@@ -105,7 +105,7 @@ class DraftRequest:
             source_chat_id=data.get("source_chat_id"),
             source_message_id=data.get("source_message_id"),
             target_chat_id=data.get("target_chat_id"),
-            target_thread_id=data.get("target_thread_id"),
+            topic_id=data.get("topic_id"),
             context_tag=data.get("context_tag"),
             metadata=data.get("metadata") or {},
         )
@@ -114,7 +114,7 @@ class DraftRequest:
 @dataclass(frozen=True)
 class DraftResult:
     draft: str
-    summary: ThreadSummary
+    summary: Brief
     style_examples: list[str] = field(default_factory=list)
     # The thread this draft was segmented into (Build 2), so the /decide edit
     # path can attach an intent note to the right thread. None when thread

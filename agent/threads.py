@@ -38,7 +38,7 @@ import asyncpg
 from dotenv import load_dotenv
 
 from agent.llm import LLMClient, build_llm_client
-from agent.types import ChatMessage, ThreadSummary
+from agent.types import Brief, ChatMessage
 
 VALID_STAGES = {"mid-step", "awaiting-owner", "done"}
 
@@ -56,11 +56,11 @@ class ThreadState:
     current_task: str
     stage: str
     # goal/now/next/open the labeler produced for THIS message (thread-aware).
-    summary: ThreadSummary = field(
-        default_factory=lambda: ThreadSummary.empty()
+    summary: Brief = field(
+        default_factory=lambda: Brief.empty()
     )
 
-    def to_thread_summary(self) -> ThreadSummary:
+    def to_thread_summary(self) -> Brief:
         return self.summary
 
 
@@ -245,14 +245,14 @@ def _coerce_stage(value: object) -> str:
     return stage if stage in VALID_STAGES else "mid-step"
 
 
-def _summary_from_decision(decision: dict) -> ThreadSummary:
+def _summary_from_decision(decision: dict) -> Brief:
     open_items = decision.get("open", [])
     if isinstance(open_items, str):
         open_items = [open_items]
     goal = str(decision.get("goal") or "").strip() or "Advance the current thread."
     now = str(decision.get("now") or "").strip() or "Review the latest message."
     nxt = str(decision.get("next") or "").strip() or "Take the next concrete step."
-    return ThreadSummary(
+    return Brief(
         goal=goal,
         now=now,
         next=nxt,

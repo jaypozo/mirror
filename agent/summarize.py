@@ -8,7 +8,7 @@ import sys
 from typing import Any
 
 from agent.llm import LLMClient, build_llm_client
-from agent.types import ChatMessage, ThreadSummary
+from agent.types import Brief, ChatMessage
 
 
 SUMMARY_SYSTEM_PROMPT = """You summarize live work threads for the owner.
@@ -21,7 +21,7 @@ Use the Goal / Now / Next / Open shape:
 Do not invent facts."""
 
 
-def parse_summary_json(text: str) -> ThreadSummary | None:
+def parse_summary_json(text: str) -> Brief | None:
     try:
         data = json.loads(text)
     except json.JSONDecodeError:
@@ -35,18 +35,18 @@ def parse_summary_json(text: str) -> ThreadSummary | None:
             return None
     if not isinstance(data, dict):
         return None
-    return ThreadSummary.from_dict(data)
+    return Brief.from_dict(data)
 
 
-def heuristic_summary(thread: list[ChatMessage]) -> ThreadSummary:
+def heuristic_summary(thread: list[ChatMessage]) -> Brief:
     if not thread:
-        return ThreadSummary.empty()
+        return Brief.empty()
 
     latest = thread[-1].text.strip()
     first = thread[0].text.strip()
     goal = first[:180] if first else "Resolve the current thread."
     now = latest[:220] if latest else "A reply may be needed."
-    return ThreadSummary(
+    return Brief(
         goal=goal,
         now=now,
         next="Draft a concise response that moves the thread forward.",
@@ -57,9 +57,9 @@ def heuristic_summary(thread: list[ChatMessage]) -> ThreadSummary:
 async def summarize_thread(
     thread: list[ChatMessage],
     llm: LLMClient | None = None,
-) -> ThreadSummary:
+) -> Brief:
     if not thread:
-        return ThreadSummary.empty()
+        return Brief.empty()
 
     client = llm or build_llm_client()
     transcript = "\n".join(message.to_prompt_line() for message in thread[-40:])
