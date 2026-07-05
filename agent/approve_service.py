@@ -58,6 +58,7 @@ from agent.draft import draft_reply
 from agent.edit_classify import classify_edit
 from agent.eligibility import EXCLUDED_TOPIC_CHAT_ID
 from agent.feedback import record_feedback
+from agent.scoreboard import compute_scoreboard, validate_init_data
 from agent.threads import record_intent_note
 from agent.service import maybe_resume_backfill  # reuse the drip resumer as-is
 from agent.types import ChatMessage, DraftRequest, DraftResult
@@ -65,6 +66,12 @@ from agent.types import ChatMessage, DraftRequest, DraftResult
 log = logging.getLogger("mirror.approve_service")
 
 OWNER_USER_ID = int(os.getenv("MIRROR_OWNER_USER_ID", "0") or "0")
+# Bot token used to sign the Mini App's Telegram WebApp initData. Read from the
+# environment ONLY (never hard-coded / logged) — set MIRROR_WEBAPP_BOT_TOKEN in
+# the service .env to the token of whichever bot hosts the Scoreboard menu button.
+WEBAPP_BOT_TOKEN = (os.getenv("MIRROR_WEBAPP_BOT_TOKEN") or "").strip()
+# Absolute path to the self-contained Mini App HTML (served over the tunnel).
+WEBAPP_HTML_PATH = Path(__file__).resolve().parent.parent / "webapp" / "scoreboard.html"
 PENDING_TTL_SECONDS = 60 * 60  # drafts older than this are swept (nothing sent)
 
 # Pending drafts are persisted here so a service restart doesn't orphan an
@@ -537,6 +544,45 @@ async def send_as_owner(request: DraftRequest, text: str):
 
 
 # --------------------------------------------------------------------------- #
+# GET /scoreboard  — metrics for the owner-only Telegram Mini App.
+#
+# Auth (either):
+#   * X-Mirror-Secret header (local testing / same shared secret as /draft), OR
+#   * a valid Telegram WebApp initData, HMAC-signed by MIRROR_WEBAPP_BOT_TOKEN
+#     AND whose user id == the owner. The Mini App sends it in the
+#     `X-Telegram-Init-Data` header (or `?init_data=` query for convenience).
+#
+# Returns the full scoreboard JSON (see agent/scoreboard.compute_scoreboard).
+# Read-only: touches no chat, sends nothing. Optional ?bucket=day|week.
+# --------------------------------------------------------------------------- #
+def _scoreboard_authorized(request: web.Request) -> bool:
+    if _authorized(request):
+        return True
+    init_data = request.headers.get("X-Telegram-Init-Data") or request.query.get("init_data")
+    if not init_data:
+        return False
+    return validate_init_data(init_data, WEBAPP_BOT_TOKEN, OWNER_USER_ID)
+
+
+async def handle_scoreboard(request: web.Request) -> web.Response:
+    if not _scoreboard_authorized(request):
+        return web.json_response({"ok": False, "reason": "unauthorized"}, status=401)
+    bucket = request.query.get("bucket")
+    data = await compute_scoreboard(granularity=bucket)
+    return web.json_response(data)
+
+
+async def handle_webapp(request: web.Request) -> web.Response:
+    """Serve the self-contained Mini App HTML. Public (no data leaks — every
+    number comes from the auth-gated /scoreboard call the page makes itself)."""
+    try:
+        return web.FileResponse(WEBAPP_HTML_PATH)
+    except Exception as exc:
+        log.warning("could not serve scoreboard html: %s", exc)
+        return web.Response(status=404, text="not found")
+
+
+# --------------------------------------------------------------------------- #
 # Health.
 # --------------------------------------------------------------------------- #
 async def handle_health(request: web.Request) -> web.Response:
@@ -600,6 +646,9 @@ async def build_and_run() -> None:
             web.post("/draft", handle_draft),
             web.post("/decide", handle_decide),
             web.get("/health", handle_health),
+            web.get("/scoreboard", handle_scoreboard),
+            web.get("/scoreboard.html", handle_webapp),
+            web.get("/", handle_webapp),
         ]
     )
 

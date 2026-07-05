@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="color-scheme" content="light dark" />
+<title>Mirror Scoreboard</title>
+<!-- The ONE external script Telegram Mini Apps allow; everything else is inline. -->
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  :root {
+    --bg: #0f1115;
+    --card: #171a21;
+    --card-2: #1d212b;
+    --text: #e8eaed;
+    --muted: #9aa0ac;
+    --line: #2a2f3a;
+    --accent: #5aa2ff;
+    --good: #3ecf8e;
+    --bad: #ff6b6b;
+    --grid: #232833;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #f4f5f7;
+      --card: #ffffff;
+      --card-2: #f7f8fa;
+      --text: #1b1f27;
+      --muted: #6b7280;
+      --line: #e3e6eb;
+      --accent: #2b6fff;
+      --good: #12a56a;
+      --bad: #e03e3e;
+      --grid: #eceef2;
+    }
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body {
+    margin: 0; padding: 0;
+    background: var(--tg-bg, var(--bg));
+    color: var(--tg-text, var(--text));
+    font: 15px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 620px; margin: 0 auto; padding: 18px 14px 40px; }
+  header { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 4px; }
+  h1 { font-size: 19px; font-weight: 700; margin: 0; letter-spacing: -0.2px; }
+  .sub { color: var(--muted); font-size: 12.5px; margin: 2px 0 16px; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; margin-bottom: 18px; }
+  @media (max-width: 460px) { .grid { grid-template-columns: 1fr; } }
+  .tile {
+    background: var(--card); border: 1px solid var(--line); border-radius: 14px;
+    padding: 13px 13px 12px;
+  }
+  .tile .label { color: var(--muted); font-size: 11.5px; text-transform: uppercase; letter-spacing: .5px; font-weight: 600; }
+  .tile .val { font-size: 27px; font-weight: 750; margin-top: 6px; letter-spacing: -0.5px; }
+  .tile .delta { font-size: 12px; margin-top: 3px; font-weight: 600; }
+  .up { color: var(--good); } .down { color: var(--bad); } .flat { color: var(--muted); }
+  .card {
+    background: var(--card); border: 1px solid var(--line); border-radius: 14px;
+    padding: 14px 14px 10px; margin-bottom: 14px;
+  }
+  .card h2 { font-size: 14px; margin: 0 0 2px; font-weight: 650; }
+  .card .hint { color: var(--muted); font-size: 12px; margin: 0 0 8px; }
+  svg { display: block; width: 100%; height: auto; overflow: visible; }
+  .totals { display: flex; flex-wrap: wrap; gap: 8px; }
+  .chip {
+    background: var(--card-2); border: 1px solid var(--line); border-radius: 999px;
+    padding: 6px 11px; font-size: 12.5px; color: var(--muted);
+  }
+  .chip b { color: var(--tg-text, var(--text)); font-weight: 700; }
+  .empty, .err {
+    text-align: center; color: var(--muted); padding: 44px 16px; font-size: 14px;
+    background: var(--card); border: 1px solid var(--line); border-radius: 14px;
+  }
+  .err { color: var(--bad); }
+  .skeleton { animation: pulse 1.2s ease-in-out infinite; }
+  @keyframes pulse { 0%,100% { opacity: .5; } 50% { opacity: .85; } }
+  footer { color: var(--muted); font-size: 11px; text-align: center; margin-top: 16px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Mirror Scoreboard</h1>
+    <span id="gran" class="sub" style="margin:0"></span>
+  </header>
+  <div class="sub">Is the drafter learning the owner&rsquo;s voice?</div>
+  <div id="app">
+    <div class="empty skeleton">Loading&hellip;</div>
+  </div>
+  <footer id="foot"></footer>
+</div>
+
+<script>
+(function () {
+  "use strict";
+  var tg = window.Telegram && window.Telegram.WebApp ? window.Telegram.WebApp : null;
+  if (tg) {
+    try { tg.ready(); tg.expand(); } catch (e) {}
+    // Adopt Telegram's theme colors so the page matches the client chrome.
+    var tp = tg.themeParams || {};
+    var root = document.documentElement.style;
+    if (tp.bg_color) root.setProperty("--tg-bg", tp.bg_color);
+    if (tp.text_color) root.setProperty("--tg-text", tp.text_color);
+  }
+
+  var app = document.getElementById("app");
+  var NBSP = " ";
+
+  function pct(x) { return x == null ? "—" : Math.round(x * 100) + "%"; }
+  function num(x, d) { return x == null ? "—" : (Math.round(x * Math.pow(10, d)) / Math.pow(10, d)).toFixed(d); }
+  function esc(s) { return String(s).replace(/[&<>]/g, function (c) { return ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" })[c]; }); }
+
+  function deltaEl(delta, invert) {
+    if (delta == null) return '<div class="delta flat">no prior period</div>';
+    var better = invert ? delta < 0 : delta > 0;
+    var arrow = delta > 0 ? "▲" : (delta < 0 ? "▼" : "–");
+    var cls = delta === 0 ? "flat" : (better ? "up" : "down");
+    var mag = Math.abs(Math.round(delta * 1000) / 1000);
+    return '<div class="delta ' + cls + '">' + arrow + " " + mag + " vs prior</div>";
+  }
+
+  // Hand-rolled SVG line chart (no chart lib). series: [{bucket, value}]
+  function lineChart(series, opts) {
+    opts = opts || {};
+    var W = 560, H = 150, padL = 34, padR = 12, padT = 12, padB = 24;
+    var pts = series.filter(function (s) { return s.value != null; });
+    if (!pts.length) {
+      return '<svg viewBox="0 0 ' + W + ' ' + H + '"><text x="' + (W / 2) + '" y="' + (H / 2) +
+        '" text-anchor="middle" fill="var(--muted)" font-size="13">not enough data yet</text></svg>';
+    }
+    var vals = pts.map(function (p) { return p.value; });
+    var lo = opts.min != null ? opts.min : Math.min.apply(null, vals);
+    var hi = opts.max != null ? opts.max : Math.max.apply(null, vals);
+    if (opts.pad) { var r = (hi - lo) || Math.abs(hi) || 1; lo -= r * 0.15; hi += r * 0.15; }
+    if (hi === lo) { hi += 1; lo -= 1; }
+    var iw = W - padL - padR, ih = H - padT - padB;
+    var n = pts.length;
+    function X(i) { return padL + (n === 1 ? iw / 2 : (i / (n - 1)) * iw); }
+    function Y(v) { return padT + ih - ((v - lo) / (hi - lo)) * ih; }
+
+    var svg = '<svg viewBox="0 0 ' + W + ' ' + H + '" role="img">';
+    // gridlines + y labels (3 ticks)
+    for (var g = 0; g <= 2; g++) {
+      var gv = lo + (g / 2) * (hi - lo), gy = Y(gv);
+      svg += '<line x1="' + padL + '" y1="' + gy + '" x2="' + (W - padR) + '" y2="' + gy +
+        '" stroke="var(--grid)" stroke-width="1"/>';
+      svg += '<text x="' + (padL - 6) + '" y="' + (gy + 3.5) + '" text-anchor="end" fill="var(--muted)" font-size="10">' +
+        (opts.fmt ? opts.fmt(gv) : (Math.round(gv * 100) / 100)) + '</text>';
+    }
+    // area + line
+    var d = "", area = "";
+    pts.forEach(function (p, i) {
+      var x = X(i), y = Y(p.value);
+      d += (i ? "L" : "M") + x.toFixed(1) + " " + y.toFixed(1) + " ";
+      area += (i ? "L" : "M") + x.toFixed(1) + " " + y.toFixed(1) + " ";
+    });
+    var col = opts.color || "var(--accent)";
+    area += "L" + X(n - 1).toFixed(1) + " " + (padT + ih) + " L" + X(0).toFixed(1) + " " + (padT + ih) + " Z";
+    svg += '<path d="' + area + '" fill="' + col + '" opacity="0.10"/>';
+    svg += '<path d="' + d + '" fill="none" stroke="' + col + '" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round"/>';
+    // dots
+    pts.forEach(function (p, i) {
+      svg += '<circle cx="' + X(i).toFixed(1) + '" cy="' + Y(p.value).toFixed(1) + '" r="2.6" fill="' + col + '"/>';
+    });
+    // x labels: first + last (compact)
+    function lbl(b) { return b ? b.slice(5) : ""; }
+    svg += '<text x="' + X(0) + '" y="' + (H - 7) + '" text-anchor="start" fill="var(--muted)" font-size="10">' + lbl(pts[0].bucket) + '</text>';
+    if (n > 1) svg += '<text x="' + X(n - 1) + '" y="' + (H - 7) + '" text-anchor="end" fill="var(--muted)" font-size="10">' + lbl(pts[n - 1].bucket) + '</text>';
+    svg += "</svg>";
+    return svg;
+  }
+
+  function render(d) {
+    if (!d || d.ok === false) { app.innerHTML = '<div class="err">' + esc((d && d.reason) || "Failed to load.") + '</div>'; return; }
+    document.getElementById("gran").textContent = "per " + (d.granularity || "day");
+
+    if (d.empty || (d.totals && d.totals.total === 0)) {
+      app.innerHTML = '<div class="empty">No decisions logged yet.<br>Approve, edit or dismiss a few drafts and the trends will appear here.</div>';
+      return;
+    }
+
+    var ar = d.approve_rate || {}, em = d.edit_magnitude || {}, ss = d.style_similarity;
+    var t = d.totals || {};
+
+    var html = '';
+    // Stat tiles
+    html += '<div class="grid">';
+    html += '<div class="tile"><div class="label">Approve, no edit</div><div class="val">' + pct(ar.current) + '</div>' + deltaEl(ar.delta, false) + '</div>';
+    html += '<div class="tile"><div class="label">Avg edit size</div><div class="val">' + (em.current == null ? "—" : pct(em.current)) + '</div>' + deltaEl(em.delta, true) + '</div>';
+    var sv = ss ? ss.current : null;
+    html += '<div class="tile"><div class="label">Voice match</div><div class="val">' + (sv == null ? "—" : pct(sv)) + '</div>' + (ss ? deltaEl(ss.delta, false) : '<div class="delta flat">n/a</div>') + '</div>';
+    html += '</div>';
+
+    // Charts
+    html += '<div class="card"><h2>Approve-without-edit rate</h2><p class="hint">approves ÷ (approves + edits) — higher is better</p>' +
+      lineChart(ar.series || [], { min: 0, max: 1, color: "var(--good)", fmt: function (v) { return Math.round(v * 100) + "%"; } }) + '</div>';
+
+    html += '<div class="card"><h2>Edit magnitude</h2><p class="hint">how much the owner rewrites an edited draft — lower is better</p>' +
+      lineChart(em.series || [], { min: 0, color: "var(--accent)", pad: true, fmt: function (v) { return Math.round(v * 100) + "%"; } }) + '</div>';
+
+    if (ss && ss.series && ss.series.length) {
+      html += '<div class="card"><h2>Style similarity</h2><p class="hint">draft voice vs the owner’s real messages — higher is better</p>' +
+        lineChart(ss.series, { color: "var(--good)", pad: true, fmt: function (v) { return num(v, 2); } }) + '</div>';
+    } else {
+      html += '<div class="card"><h2>Style similarity</h2><p class="hint">draft voice vs the owner’s real messages</p>' +
+        '<div class="empty" style="padding:22px">style axis unavailable</div></div>';
+    }
+
+    // Totals
+    var ek = t.edit_kind || {};
+    var ekParts = Object.keys(ek).map(function (k) { return '<span class="chip">' + esc(k) + " <b>" + ek[k] + "</b></span>"; }).join("");
+    html += '<div class="card"><h2>Totals</h2><div class="totals">' +
+      '<span class="chip">approve <b>' + (t.approve || 0) + '</b></span>' +
+      '<span class="chip">edit <b>' + (t.edit || 0) + '</b></span>' +
+      '<span class="chip">dismiss <b>' + (t.dismiss || 0) + '</b></span>' +
+      '<span class="chip">total <b>' + (t.total || 0) + '</b></span>' +
+      '</div>' + (ekParts ? '<div class="totals" style="margin-top:8px">' + ekParts + '</div>' : '') + '</div>';
+
+    app.innerHTML = html;
+    var when = d.generated_at ? new Date(d.generated_at).toLocaleString() : "";
+    document.getElementById("foot").textContent = when ? ("updated " + when) : "";
+  }
+
+  var initData = (tg && tg.initData) ? tg.initData : "";
+  var headers = { "Accept": "application/json" };
+  if (initData) headers["X-Telegram-Init-Data"] = initData;
+  // Fallback for a browser (no Telegram): allow ?secret= for local testing.
+  var qs = new URLSearchParams(location.search);
+  if (!initData && qs.get("secret")) headers["X-Mirror-Secret"] = qs.get("secret");
+
+  fetch("/scoreboard", { headers: headers, credentials: "omit" })
+    .then(function (r) {
+      if (r.status === 401) throw new Error("Not authorized — open this from the owner’s Telegram menu button.");
+      return r.json();
+    })
+    .then(render)
+    .catch(function (e) { app.innerHTML = '<div class="err">' + esc(e.message || String(e)) + '</div>'; });
+})();
+</script>
+</body>
+</html>
