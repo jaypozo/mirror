@@ -5,12 +5,82 @@ from __future__ import annotations
 import json
 import os
 import sys
+from dataclasses import dataclass
 from typing import Any
 
 import asyncpg
 from dotenv import load_dotenv
 
 from agent.types import ThreadSummary
+
+
+@dataclass(frozen=True)
+class EditCorrection:
+    """One past case where the owner corrected a draft before sending."""
+
+    original_draft: str
+    final_text: str
+    summary: dict[str, Any]
+
+
+async def fetch_recent_edits(limit: int = 8) -> list[EditCorrection]:
+    """Return up to `limit` most-recent action='edit' rows (owner corrected the
+    draft before sending) as voice-correction examples for drafting.
+
+    Best-effort: any DB hiccup returns [] so drafting is never blocked. Long text
+    is truncated to keep the prompt cheap.
+    """
+    load_dotenv()
+    database_url = os.getenv("DATABASE_URL")
+    if not database_url:
+        return []
+
+    def _trunc(value: str | None, cap: int = 600) -> str:
+        text = (value or "").strip()
+        return text if len(text) <= cap else text[:cap].rstrip() + "…"
+
+    try:
+        conn = await asyncpg.connect(database_url)
+    except Exception as exc:
+        print(f"[feedback] fetch_recent_edits connect failed: {exc}", file=sys.stderr)
+        return []
+    try:
+        rows = await conn.fetch(
+            """
+            SELECT original_draft, final_text, summary
+            FROM feedback
+            WHERE action = 'edit'
+              AND final_text IS NOT NULL
+              AND length(trim(final_text)) > 0
+              AND original_draft IS NOT NULL
+              AND final_text <> original_draft
+            ORDER BY ts DESC
+            LIMIT $1
+            """,
+            max(1, int(limit)),
+        )
+    except Exception as exc:
+        print(f"[feedback] fetch_recent_edits query failed: {exc}", file=sys.stderr)
+        return []
+    finally:
+        await conn.close()
+
+    corrections: list[EditCorrection] = []
+    for r in rows:
+        summary = r["summary"]
+        if isinstance(summary, str):
+            try:
+                summary = json.loads(summary)
+            except Exception:
+                summary = {}
+        corrections.append(
+            EditCorrection(
+                original_draft=_trunc(r["original_draft"]),
+                final_text=_trunc(r["final_text"]),
+                summary=summary if isinstance(summary, dict) else {},
+            )
+        )
+    return corrections
 
 
 async def record_feedback(

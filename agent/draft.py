@@ -15,6 +15,7 @@ import asyncio
 import json
 import sys
 
+from agent.feedback import EditCorrection, fetch_recent_edits
 from agent.llm import LLMClient, build_llm_client
 from agent.retrieve import RetrievedExample, retrieve_examples
 from agent.summarize import summarize_thread
@@ -45,6 +46,38 @@ def format_examples(examples: list[RetrievedExample]) -> str:
     return "\n\n".join(blocks)
 
 
+def format_corrections(corrections: list[EditCorrection]) -> str:
+    """Render past owner edits as explicit correction examples: what was drafted
+    vs. what the owner actually sent. Empty string when there are none."""
+    if not corrections:
+        return ""
+    blocks = []
+    for index, c in enumerate(corrections, 1):
+        goal = str((c.summary or {}).get("goal") or "").strip()
+        context = f" (context: {goal})" if goal else ""
+        blocks.append(
+            f"Correction {index}{context}:\n"
+            f"You previously drafted: {c.original_draft}\n"
+            f"The owner corrected it to: {c.final_text}"
+        )
+    body = "\n\n".join(blocks)
+    return (
+        "\nThe owner has corrected past drafts. Learn from these — match the "
+        "voice, length, and decisions of the CORRECTED version, not the original:\n"
+        f"{body}\n"
+    )
+
+
+async def _load_corrections(limit: int = 8) -> list[EditCorrection]:
+    """Fetch recent owner edits for the prompt. Guarded: any failure yields no
+    examples so a DB hiccup never breaks drafting."""
+    try:
+        return await fetch_recent_edits(limit=limit)
+    except Exception as exc:
+        print(f"[draft] could not load edit corrections (ignored): {exc}", file=sys.stderr)
+        return []
+
+
 def heuristic_draft(request: DraftRequest) -> str:
     if "?" in request.incoming_message:
         return "Let me check one detail and get back to you."
@@ -71,6 +104,9 @@ async def draft_reply(
         context_tag=request.context_tag,
     )
 
+    # Learning signal: recent cases where the owner edited a draft before sending.
+    corrections = await _load_corrections()
+
     # Thread summary is optional: it costs a second codex call, so it's off by
     # default to keep drafting to one stateless exec per reply.
     resolved_summary = summary
@@ -86,10 +122,12 @@ async def draft_reply(
     if resolved_summary is not None:
         summary_block = f"\nThread summary:\n{resolved_summary.format_for_telegram()}\n"
 
+    corrections_block = format_corrections(corrections)
+
     user_prompt = f"""Here are real examples of how the owner replies:
 
 {format_examples(examples)}
-{thread_block}{summary_block}
+{corrections_block}{thread_block}{summary_block}
 Now draft the owner's reply to this incoming message:
 {request.incoming_message}
 

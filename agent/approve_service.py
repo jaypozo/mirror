@@ -39,9 +39,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import pickle
 import signal
+import time
 import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from aiohttp import web
 from dotenv import load_dotenv
@@ -61,10 +64,18 @@ log = logging.getLogger("mirror.approve_service")
 OWNER_USER_ID = int(os.getenv("MIRROR_OWNER_USER_ID", "0") or "0")
 PENDING_TTL_SECONDS = 60 * 60  # drafts older than this are swept (nothing sent)
 
+# Pending drafts are persisted here so a service restart doesn't orphan an
+# undecided card (which would make Approve silently no-op). Only the Pending
+# dataclasses are pickled — never the TelegramClient. Path is relative to the
+# service WorkingDirectory (logs/ already exists).
+PENDING_STORE_PATH = Path(os.getenv("MIRROR_PENDING_STORE", "logs/pending.pkl"))
+
 
 # --------------------------------------------------------------------------- #
-# Pending drafts (in-memory; a restart drops undecided drafts, which is safe —
-# nothing was sent). Keyed by approval_id.
+# Pending drafts. Kept in-memory AND mirrored to disk (PENDING_STORE_PATH) so an
+# undecided draft survives a restart; entries older than PENDING_TTL_SECONDS are
+# dropped on load. created_at is WALL-CLOCK time.time() (monotonic loop time
+# resets on restart and can't be compared across processes). Keyed by approval_id.
 # --------------------------------------------------------------------------- #
 @dataclass
 class Pending:
@@ -118,10 +129,54 @@ def _thread_from_payload(items: list[dict]) -> list[ChatMessage]:
 
 def _sweep_expired() -> None:
     assert STATE is not None
-    now = asyncio.get_event_loop().time()
+    now = time.time()
     for aid, p in list(STATE.pending.items()):
         if now - p.created_at > PENDING_TTL_SECONDS:
             STATE.pending.pop(aid, None)
+
+
+def _save_pending() -> None:
+    """Persist STATE.pending (Pending dataclasses only) to disk. Best-effort:
+    a store failure logs a warning and is otherwise ignored — never crash the
+    service over the persistence layer."""
+    if STATE is None:
+        return
+    try:
+        PENDING_STORE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = PENDING_STORE_PATH.with_suffix(PENDING_STORE_PATH.suffix + ".tmp")
+        with open(tmp, "wb") as fh:
+            pickle.dump(STATE.pending, fh, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(tmp, PENDING_STORE_PATH)
+    except Exception as exc:
+        log.warning("could not persist pending drafts: %s", exc)
+
+
+def _load_pending() -> None:
+    """Restore STATE.pending from disk at startup, dropping entries older than
+    PENDING_TTL_SECONDS. Best-effort: any failure logs a warning and leaves
+    pending empty so the service still comes up."""
+    assert STATE is not None
+    if not PENDING_STORE_PATH.exists():
+        return
+    try:
+        with open(PENDING_STORE_PATH, "rb") as fh:
+            restored = pickle.load(fh)
+    except Exception as exc:
+        log.warning("could not load persisted pending drafts: %s", exc)
+        return
+    if not isinstance(restored, dict):
+        log.warning("persisted pending store had unexpected type %s; ignoring", type(restored))
+        return
+    now = time.time()
+    kept = 0
+    for aid, p in restored.items():
+        try:
+            if now - float(p.created_at) <= PENDING_TTL_SECONDS:
+                STATE.pending[aid] = p
+                kept += 1
+        except Exception:
+            continue
+    log.info("restored %d pending draft(s)", kept)
 
 
 # --------------------------------------------------------------------------- #
@@ -186,8 +241,9 @@ async def handle_draft(request: web.Request) -> web.Response:
         approval_id=approval_id,
         request=draft_request,
         result=result,
-        created_at=asyncio.get_event_loop().time(),
+        created_at=time.time(),
     )
+    _save_pending()
     log.info("drafted approval_id=%s chat=%s", approval_id, chat_id)
 
     return web.json_response(
@@ -227,7 +283,15 @@ async def handle_decide(request: web.Request) -> web.Response:
 
     pending = STATE.pending.get(approval_id)
     if pending is None:
-        return web.json_response({"ok": False, "reason": "no such pending draft"})
+        # Unambiguous 410 so the caller (and the plugin) can tell a lost/expired
+        # draft apart from a normal decline, even before rendering the reason.
+        return web.json_response(
+            {
+                "ok": False,
+                "reason": "expired: this draft was lost (service restarted) — ask again for a fresh one",
+            },
+            status=410,
+        )
 
     if action == "dismiss":
         await record_feedback(
@@ -242,6 +306,7 @@ async def handle_decide(request: web.Request) -> web.Response:
             metadata=pending.request.metadata,
         )
         STATE.pending.pop(approval_id, None)
+        _save_pending()
         return web.json_response({"ok": True, "action": "dismiss", "sent": False})
 
     if action in ("approve", "edit"):
@@ -267,6 +332,7 @@ async def handle_decide(request: web.Request) -> web.Response:
             metadata=pending.request.metadata,
         )
         STATE.pending.pop(approval_id, None)
+        _save_pending()
         log.info("sent-as-owner approval_id=%s action=%s", approval_id, action)
         return web.json_response({"ok": True, "action": action, "sent": True})
 
@@ -352,6 +418,9 @@ async def build_and_run() -> None:
         )
 
     STATE = ServiceState(user=user)
+    # Restore any undecided drafts orphaned by a restart (best-effort; drops
+    # entries past the TTL). Must happen before the server starts serving.
+    _load_pending()
 
     app = web.Application()
     app.add_routes(
