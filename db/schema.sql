@@ -68,6 +68,63 @@ CREATE TABLE IF NOT EXISTS feedback (
 CREATE INDEX IF NOT EXISTS feedback_action_ts_idx
     ON feedback (action, ts);
 
+-- Edit classification (DUAL learning). An owner edit can change STYLE (phrasing/
+-- voice, same meaning), INTENT/SUBSTANCE (a fact/decision/goal changed), BOTH, or
+-- be TRIVIAL. `edit_kind` is set at capture in the /decide edit path (a guarded
+-- LLM compares original_draft vs final_text); `edit_note` is a one-line
+-- what-changed. NULL for approve/dismiss and for legacy/unclassified rows.
+--   * STYLE / BOTH  -> train the voice channel (style sheet + edit few-shots).
+--   * INTENT / BOTH -> train the intent channel (intent_notes below); a pure
+--     INTENT edit must NEVER train voice (a decision change is not a voice signal).
+ALTER TABLE feedback ADD COLUMN IF NOT EXISTS edit_kind text
+    CHECK (edit_kind IS NULL OR edit_kind IN ('style', 'intent', 'both', 'trivial'));
+ALTER TABLE feedback ADD COLUMN IF NOT EXISTS edit_note text;
+
+CREATE INDEX IF NOT EXISTS feedback_edit_kind_ts_idx
+    ON feedback (edit_kind, ts);
+
+-- Project-aware state. The owner interleaves MULTIPLE projects in one
+-- conversation. Each incoming message is segmented to the best-matching active
+-- project (embedding pre-rank over `anchor_embedding` + a cheap LLM labeler in
+-- agent/projects.py), or a new project is opened. Per-project `goal`,
+-- `current_task`, and `stage` are maintained (LLM update step) so the Goal/Now/
+-- Next summary and the draft reflect the matched project's objective and where in
+-- the task we are — not a flat window of recent messages.
+CREATE TABLE IF NOT EXISTS projects (
+    id bigserial PRIMARY KEY,
+    title text NOT NULL,
+    goal text,
+    current_task text,
+    stage text NOT NULL DEFAULT 'mid-step'
+        CHECK (stage IN ('mid-step', 'awaiting-owner', 'done')),
+    anchors jsonb NOT NULL DEFAULT '{}'::jsonb,
+    anchor_embedding vector(384),
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS projects_updated_at_idx
+    ON projects (updated_at DESC);
+
+-- Intent/decision learning channel. Captured from INTENT/BOTH edits (Build 1):
+-- what the owner actually decided or intended, tied to the feedback row that
+-- produced it and to the project it belongs to (Build 2). Recent notes for the
+-- matched project are injected into the draft prompt + the project state update,
+-- so future goal-summaries and drafts reflect real decisions rather than a stale
+-- draft's guess.
+CREATE TABLE IF NOT EXISTS intent_notes (
+    id bigserial PRIMARY KEY,
+    project_id bigint REFERENCES projects (id) ON DELETE SET NULL,
+    feedback_id bigint REFERENCES feedback (id) ON DELETE SET NULL,
+    note text NOT NULL,
+    source_chat_id bigint,
+    source_message_id bigint,
+    ts timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS intent_notes_project_ts_idx
+    ON intent_notes (project_id, ts DESC);
+
 -- Living style sheet: a distilled "how the owner writes" guide, regenerated
 -- periodically (agent/style_sheet.py) PRIMARILY from the owner's own message
 -- corpus (direction='out') and refined by the edit-feedback loop. The newest

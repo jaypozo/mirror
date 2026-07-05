@@ -141,6 +141,57 @@ feedback" approach follows
 and the personalization-from-history framing of
 [arXiv:2308.07968 (Teach LLMs to Personalize)](https://arxiv.org/abs/2308.07968).
 
+### Dual learning: STYLE edits vs. INTENT edits (`agent/edit_classify.py`)
+
+Not every edit is a voice correction. When the owner rewrites a draft they may
+change **style** (phrasing/tone/length, same meaning), **intent/substance** (a
+fact, decision, number, or commitment changed), **both**, or make a **trivial**
+tweak. Training a single "prefer this" channel on all of them is wrong: a
+decision change would teach the drafter a phrasing "rule" that was never about
+phrasing.
+
+At capture (the `/decide` edit path, after the send already succeeded, fully
+guarded) a lightweight LLM classifies `original_draft` vs. `final_text` into
+`style | intent | both | trivial` with a one-line what-changed note, persisted on
+the `feedback` row (`edit_kind`, `edit_note`). Learning is then **routed**:
+
+- **STYLE / BOTH → the voice channel.** `fetch_recent_edits` (the draft-time
+  voice corrections) and the style-sheet rule miner both now filter to
+  `edit_kind IN ('style','both')` (plus legacy unclassified rows) and **exclude
+  pure `intent`** — a decision change never trains voice.
+- **INTENT / BOTH → the intent/decision channel.** The what-changed note is stored
+  as a durable **intent note** (`intent_notes`) tied to the feedback row and the
+  matched project (below), so future goal-summaries and drafts reflect what the
+  owner actually decided, not a stale draft's guess.
+
+A classify/DB failure degrades to a local heuristic and never blocks capture or
+sending.
+
+### Project-aware goal state (`agent/projects.py`)
+
+The owner runs **multiple projects interleaved in one conversation**. A flat
+summary of the last N messages can't tell which project a message belongs to, nor
+track where in a task we are. Mirror now segments each incoming message to the
+best-matching **active project** (or opens a new one) and maintains per-project
+`goal`, `current_task`, and `stage` (`mid-step | awaiting-owner | done`):
+
+1. Embed the incoming message locally (the same on-box encoder retrieval uses)
+   and **pre-rank** candidate projects by cosine distance to their stored
+   `anchor_embedding` (falling back to most-recently-updated).
+2. **One LLM call** does segmentation + state update + summary together: given the
+   message, recent thread, the candidate projects, and the matched project's
+   recent intent notes (locked-in decisions), it returns which project this is (or
+   a new one), the refreshed goal/current_task/stage, and a project-aware
+   goal/now/next/open. This call **replaces** the flat `summarize_thread` call, so
+   drafting stays at the same ~one-exec-for-the-reply + one-for-state cost.
+3. The matched project's state + recent decisions are injected into the draft
+   prompt so the reply understands the objective and where in the task we are, and
+   the project-aware summary becomes the card's Goal/Now/Next.
+
+An agent-supplied Goal/Now/Next (passed in the request) is still honored. If
+segmentation or state update fails, it falls back to the flat `summarize_thread`
+and drafting still works.
+
 ## Techniques (ranked for a stateless, closed-weight setup)
 
 Recent work shows LLMs can imitate a target style from **very few examples** when
@@ -206,10 +257,14 @@ corpus.
 
 1. **Edit-feedback loop** — recency+magnitude-weighted, capped. **Shipped.**
 2. **Living style sheet** with staged rule promotion + decay. **Shipped.**
-3. **Style-based retrieval (D)** — add a style-embedding index; select exemplars
+3. **Dual learning (STYLE vs. INTENT edits)** — classify each edit; route style to
+   the voice channel and intent to per-project decision notes. **Shipped.**
+4. **Project-aware goal state** — segment interleaved projects; per-project
+   goal/current_task/stage feeds the summary + draft. **Shipped.**
+5. **Style-based retrieval (D)** — add a style-embedding index; select exemplars
    by style, not topic.
-4. **Scoreboard** — persist the four eval metrics and surface a trend.
-5. **Preference-pair banking (G-ready)** — the `feedback` schema already captures
+6. **Scoreboard** — persist the four eval metrics and surface a trend.
+7. **Preference-pair banking (G-ready)** — the `feedback` schema already captures
    chosen/rejected pairs; formalize export for a future DPO/ORPO run once an
    open-weight drafting path exists.
 

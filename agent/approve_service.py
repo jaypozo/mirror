@@ -54,8 +54,10 @@ from telethon import TelegramClient
 load_dotenv()
 
 from agent.draft import draft_reply
+from agent.edit_classify import classify_edit
 from agent.eligibility import EXCLUDED_TOPIC_CHAT_ID
 from agent.feedback import record_feedback
+from agent.projects import record_intent_note
 from agent.service import maybe_resume_backfill  # reuse the drip resumer as-is
 from agent.types import ChatMessage, DraftRequest, DraftResult
 
@@ -320,7 +322,18 @@ async def handle_decide(request: web.Request) -> web.Response:
             log.exception("send-as-owner failed: %s", exc)
             return web.json_response({"ok": False, "reason": f"send failed: {exc}"}, status=500)
 
-        await record_feedback(
+        # DUAL learning (Build 1): classify what the owner changed so the two
+        # channels stay separate. Sending already succeeded above, so this is
+        # fully guarded — a classify/DB failure must not fail the request.
+        edit_kind: str | None = None
+        edit_note: str | None = None
+        if action == "edit":
+            try:
+                edit_kind, edit_note = await classify_edit(pending.result.draft, final)
+            except Exception as exc:
+                log.warning("edit classification failed (ignored): %s", exc)
+
+        feedback_id = await record_feedback(
             original_draft=pending.result.draft,
             final_text=final,
             action=action,
@@ -330,10 +343,33 @@ async def handle_decide(request: web.Request) -> web.Response:
             target_thread_id=pending.request.target_thread_id,
             summary=pending.result.summary,
             metadata=pending.request.metadata,
+            edit_kind=edit_kind,
+            edit_note=edit_note,
         )
+
+        # INTENT component (Build 1 -> Build 2): a decision/substance change is
+        # captured as a durable intent note against the matched project, so future
+        # summaries + drafts reflect the real decision. Guarded.
+        if action == "edit" and edit_kind in ("intent", "both"):
+            try:
+                await record_intent_note(
+                    note=(edit_note or final),
+                    project_id=pending.result.project_id,
+                    feedback_id=feedback_id,
+                    source_chat_id=pending.request.source_chat_id,
+                    source_message_id=pending.request.source_message_id,
+                )
+            except Exception as exc:
+                log.warning("record_intent_note failed (ignored): %s", exc)
+
         STATE.pending.pop(approval_id, None)
         _save_pending()
-        log.info("sent-as-owner approval_id=%s action=%s", approval_id, action)
+        log.info(
+            "sent-as-owner approval_id=%s action=%s edit_kind=%s",
+            approval_id,
+            action,
+            edit_kind,
+        )
         return web.json_response({"ok": True, "action": action, "sent": True})
 
     return web.json_response({"ok": False, "reason": f"unknown action: {action}"})

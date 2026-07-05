@@ -56,6 +56,11 @@ async def fetch_recent_edits(limit: int = 8, pool: int = 40) -> list[EditCorrect
         print(f"[feedback] fetch_recent_edits connect failed: {exc}", file=sys.stderr)
         return []
     try:
+        # DUAL learning: this is the VOICE channel, so it must learn only from
+        # edits that carry a voice signal. Prefer style/both edits and EXCLUDE
+        # pure 'intent' (a decision change is not a voice correction) and
+        # 'trivial'. Legacy rows (edit_kind NULL, pre-classification) are kept so
+        # existing corrections still train voice.
         rows = await conn.fetch(
             """
             SELECT original_draft, final_text, summary
@@ -65,6 +70,7 @@ async def fetch_recent_edits(limit: int = 8, pool: int = 40) -> list[EditCorrect
               AND length(trim(final_text)) > 0
               AND original_draft IS NOT NULL
               AND final_text <> original_draft
+              AND (edit_kind IS NULL OR edit_kind IN ('style', 'both'))
             ORDER BY ts DESC
             LIMIT $1
             """,
@@ -118,24 +124,31 @@ async def record_feedback(
     target_thread_id: int | None = None,
     summary: ThreadSummary | None = None,
     metadata: dict[str, Any] | None = None,
-) -> None:
+    edit_kind: str | None = None,
+    edit_note: str | None = None,
+) -> int | None:
+    """Persist one Approve/Edit/Dismiss decision and return its feedback id (or
+    None on failure). `edit_kind`/`edit_note` carry the DUAL-learning
+    classification for edits (see agent/edit_classify.py); they are NULL for
+    approve/dismiss. Guarded: never raises."""
     load_dotenv()
     database_url = os.getenv("DATABASE_URL")
     if not database_url:
         print("[feedback] DATABASE_URL missing; feedback was not persisted", file=sys.stderr)
-        return
+        return None
 
     conn = await asyncpg.connect(database_url)
     try:
-        await conn.execute(
+        row = await conn.fetchrow(
             """
             INSERT INTO feedback (
                 original_draft, final_text, action,
                 source_chat_id, source_message_id,
                 target_chat_id, target_thread_id,
-                summary, metadata
+                summary, metadata, edit_kind, edit_note
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9::jsonb)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9::jsonb, $10, $11)
+            RETURNING id
             """,
             original_draft,
             final_text,
@@ -146,8 +159,12 @@ async def record_feedback(
             target_thread_id,
             json.dumps(summary.to_dict() if summary else {}),
             json.dumps(metadata or {}),
+            edit_kind,
+            edit_note,
         )
+        return int(row["id"]) if row else None
     except Exception as exc:
         print(f"[feedback] failed to persist feedback: {exc}", file=sys.stderr)
+        return None
     finally:
         await conn.close()

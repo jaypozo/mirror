@@ -269,6 +269,10 @@ class _Edit:
 
 
 async def _fetch_edits(conn: asyncpg.Connection, limit: int) -> list[_Edit]:
+    # Voice channel (DUAL learning): mine style rules only from edits that carry
+    # a voice signal — style/both, plus legacy unclassified rows. Pure 'intent'
+    # edits (a decision/fact change) and 'trivial' tweaks are excluded so a
+    # decision change never becomes a phrasing "rule".
     rows = await conn.fetch(
         """
         SELECT id, original_draft, final_text
@@ -278,6 +282,7 @@ async def _fetch_edits(conn: asyncpg.Connection, limit: int) -> list[_Edit]:
           AND length(trim(final_text)) > 0
           AND original_draft IS NOT NULL
           AND final_text <> original_draft
+          AND (edit_kind IS NULL OR edit_kind IN ('style', 'both'))
         ORDER BY ts DESC
         LIMIT $1
         """,

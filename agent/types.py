@@ -116,3 +116,7 @@ class DraftResult:
     draft: str
     summary: ThreadSummary
     style_examples: list[str] = field(default_factory=list)
+    # The project this draft was segmented into (Build 2), so the /decide edit
+    # path can attach an intent note to the right project. None when project
+    # segmentation was off or failed (drafting falls back to the flat summary).
+    project_id: int | None = None

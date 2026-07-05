@@ -56,8 +56,34 @@ means changing the dim and re-embedding (the table must be empty to ALTER it).
 `id` PK, `original_draft`, `final_text` (null on dismiss), `action` CHECK IN
 ('approve','edit','dismiss'), `ts`, `source_chat_id`/`source_message_id` (the
 message being answered), `target_chat_id`/`target_thread_id` (where the reply
-went), `summary` jsonb (the Goal/Now/Next/Open snapshot), `metadata` jsonb.
-Index `(action, ts)`.
+went), `summary` jsonb (the Goal/Now/Next/Open snapshot), `metadata` jsonb,
+`edit_kind` CHECK IN ('style','intent','both','trivial') (**DUAL learning** — set
+at capture in the `/decide` edit path by a guarded LLM comparing `original_draft`
+vs `final_text`; NULL for approve/dismiss and legacy rows), `edit_note` (the
+one-line what-changed). Indexes `(action, ts)`, `(edit_kind, ts)`.
+
+> **Learning routes on `edit_kind`.** STYLE/BOTH edits feed the **voice** channel
+> (`fetch_recent_edits` and the style-sheet rule miner both filter to
+> `edit_kind IN ('style','both')` ∪ NULL, excluding pure `intent`/`trivial`).
+> INTENT/BOTH edits feed the **intent** channel (`intent_notes`). A pure decision
+> change therefore never trains voice.
+
+### `projects` — per-project goal/task/stage (project-aware summaries)
+`id` PK, `title`, `goal`, `current_task`, `stage` CHECK IN
+('mid-step','awaiting-owner','done'), `anchors` jsonb (distinctive keywords),
+`anchor_embedding vector(384)` (for embedding pre-rank when segmenting an incoming
+message), `created_at`, `updated_at`. Maintained by `agent/projects.py`: each
+incoming message is segmented to the best-matching project (embedding pre-rank +
+one LLM labeler that also refreshes goal/current_task/stage and produces a
+project-aware Goal/Now/Next). Index `(updated_at DESC)`.
+
+### `intent_notes` — durable decisions captured from INTENT/BOTH edits
+`id` PK, `project_id` → `projects(id)` ON DELETE SET NULL, `feedback_id` →
+`feedback(id)` ON DELETE SET NULL, `note` (what the owner actually decided),
+`source_chat_id`/`source_message_id`, `ts`. Written in the `/decide` edit path
+when `edit_kind IN ('intent','both')`. Recent notes for the matched project are
+injected into the draft prompt + the project state update, so future
+goal-summaries and drafts honor real decisions. Index `(project_id, ts DESC)`.
 
 ### `style_sheet` — the living, distilled "how the owner writes" guide
 `id` PK, `guide_md` (the active markdown style guide injected into every draft),
@@ -143,8 +169,13 @@ replied to. No distance threshold — it takes the top-K nearest. Fully local.
 1. Query = the incoming message (+ a tail of the last 3 thread messages as extra
    semantic anchor).
 2. `retrieve_examples()` → top-K owner replies + their context.
-3. Optional Goal/Now/Next/Open summary (off by default; a second LLM call) via
-   `agent/summarize.py`.
+3. When summaries are enabled, **project-aware state** (`agent/projects.py`):
+   segment the message to its project, refresh goal/current_task/stage, and use
+   that project-aware Goal/Now/Next as the summary (this LLM call replaces the flat
+   `summarize_thread` call, not adds to it). The matched project's state + recent
+   intent notes are injected into the draft prompt. Falls back to the flat
+   `agent/summarize.py` summary if segmentation fails. An agent-supplied summary is
+   still honored.
 4. Prompt = a **system** prompt ("draft the owner's reply in their voice; match
    tone/length/directness; output ONLY the reply; don't reveal AI; don't invent
    facts; don't copy examples verbatim") + a **user** prompt (the formatted
@@ -177,10 +208,21 @@ the model summary is the fallback.
 - **`agent/summarize.py`** — the Goal/Now/Next/Open thread summary.
 - **`agent/style.py`** — optional/legacy OpenAI-embedding RAG hook; superseded by
   `retrieve.py`.
-- **`agent/feedback.py`** — `record_feedback()` inserts one `feedback` row; no-ops
-  with a warning if `DATABASE_URL` is missing; never blocks a send.
+- **`agent/feedback.py`** — `record_feedback()` inserts one `feedback` row
+  (returning its id; accepts `edit_kind`/`edit_note`); no-ops with a warning if
+  `DATABASE_URL` is missing; never blocks a send. `fetch_recent_edits()` (voice
+  corrections) excludes pure `intent` edits.
+- **`agent/edit_classify.py`** — DUAL learning: `classify_edit(original, final)`
+  → `(kind, note)` via one guarded LLM call, heuristic fallback; classifies each
+  edit as `style|intent|both|trivial` so learning routes to the right channel.
+- **`agent/projects.py`** — project segmentation + per-project state:
+  `resolve_project(incoming, thread)` segments a message to a project (embedding
+  pre-rank + LLM labeler), updates its goal/task/stage, returns a project-aware
+  summary + recent intent notes; `record_intent_note(...)` persists a decision.
+  Fully guarded — returns None on failure so drafting falls back to the flat
+  summary.
 - **`agent/types.py`** — shared frozen dataclasses: `ChatMessage`,
-  `ThreadSummary`, `DraftRequest`, `DraftResult`.
+  `ThreadSummary`, `DraftRequest`, `DraftResult` (now carries `project_id`).
 
 ---
 
@@ -200,7 +242,11 @@ Endpoints:
   summary}`. Refuses the excluded group topic threads and empty questions.
 - **POST `/decide`** — `{approval_id, action: approve|edit|dismiss, edited_text?}`.
   `approve` sends `draft` as the owner; `edit` sends `edited_text`; `dismiss`
-  sends nothing. All three write a `feedback` row.
+  sends nothing. All three write a `feedback` row. On `edit`, after the send
+  succeeds, a guarded `classify_edit` sets `edit_kind`/`edit_note`; an
+  `intent`/`both` edit also writes an `intent_notes` row against the draft's
+  matched project (`DraftResult.project_id`). Classification/DB failures are
+  swallowed — never fail the request.
 - **GET `/health`** — `{ok, session_owner, pending}`.
 
 **Send-as-owner** (`send_as_owner`, the only path that touches a chat): sends via
