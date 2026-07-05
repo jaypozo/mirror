@@ -1,31 +1,49 @@
-# Phase 2: Mirror Agent
+# `agent/` — the draft-and-decide layer
 
-Phase 2 now has a structural implementation for draft approval. It does not require the historical corpus to produce a thread summary or draft. If the corpus and pgvector embeddings are available, `agent/draft.py` retrieves owner-style examples; otherwise it falls back to a basic style profile.
+The modules that turn an incoming message into a voice draft and handle the
+Approve / Edit / Dismiss decision. See the repo root
+[ARCHITECTURE.md](../ARCHITECTURE.md) for the full pipeline and
+[SETUP.md](../SETUP.md) for the integration contract; this file is a quick
+module map for developers reading the code.
 
-Two seams are intentionally still external:
+Two seams are intentionally external:
 
-- Message-source integration: another process must decide that a live message needs the owner and provide a `DraftRequest` payload.
-- Telegram runtime: `TELEGRAM_BOT_TOKEN` and a target `OWNER_APPROVAL_CHAT_ID` must be configured before the approval bot can run.
+- **Message-source integration** — some other process decides a live message
+  needs the owner and calls the service's `/draft` endpoint (or builds a
+  `DraftRequest`).
+- **Card UI** — the Approve / Edit / Dismiss card is rendered by a Telegram bot
+  plugin that lives outside this repo; `approve_service.py` only exposes the
+  loopback HTTP API it calls.
 
 ## Modules
 
-- `agent/summarize.py`: creates the `Goal / Now / Next / Open` summary from recent live-thread messages.
-- `agent/draft.py`: drafts the owner's reply from the incoming message, thread, summary, and optional style examples from pgvector.
-- `agent/bot.py`: posts the summary and draft to the owner with `Approve & Send`, `Edit`, and `Dismiss` inline buttons.
-- `agent/feedback.py`: persists approve, edit, and dismiss signals to the `feedback` table.
-- `agent/llm.py`: pluggable LLM interface with OpenAI and dry-run implementations.
-- `agent/style.py`: optional corpus RAG hook and basic style fallback.
-- `agent/types.py`: shared request, message, summary, and result dataclasses.
+| module | role |
+| --- | --- |
+| `approve_service.py` | the live headless HTTP service: `/draft`, `/decide`, `/health`; owns the Telethon user session; the only sender-as-owner. Warm-up gate + pending persistence + 410 on expired. |
+| `retrieve.py` | topic + style + MMR exemplar retrieval (`direction='out'` only). |
+| `style_embed.py` | the content-independent STYLE embedder (StyleDistance 768-dim, stylometric-feature fallback). |
+| `corpus.py` | the one place an owner message enters the retrievable store (`add_owner_sample`, real finals only — never a draft). |
+| `style_sheet.py` | the living style guide + staged rule promotion (`style_sheet` / `style_rules`). |
+| `edit_classify.py` | dual learning — classify an edit `style | intent | both | trivial`. |
+| `threads.py` | thread segmentation + per-thread goal/current_task/stage + intent notes. |
+| `draft.py` | builds the system+user prompt (style sheet + exemplars + edits + thread state) and calls the LLM. |
+| `summarize.py` | the flat Goal / Now / Next / Open summary (fallback when thread segmentation is off/failed). |
+| `feedback.py` | `record_feedback()` / `fetch_recent_edits()` — writes the learning signal; voice fetch excludes pure-intent edits. |
+| `eligibility.py` | pure filter for whether an incoming message should be drafted. |
+| `llm.py` | pluggable LLM client (`codex` default, `openai`, `dry-run`). |
+| `types.py` | shared dataclasses: `ChatMessage`, `Brief`, `DraftRequest`, `DraftResult`. |
+| `service.py` | alternate UI: drives its own Mirror-bot DM as the approval card (`MIRROR_BOT_TOKEN`). |
+| `bot.py` / `demo.py` | legacy python-telegram-bot scaffold, and the end-to-end demo. |
 
-## Payload Shape
+## `DraftRequest` payload shape
 
-The source integration should pass this shape to `DraftRequest.from_dict()` or to the `/draft` command as JSON:
+`DraftRequest.from_dict()` accepts:
 
 ```json
 {
   "incoming_message": "Can you review this before I ship it?",
   "thread": [
-    {"sender_name": "Naveed", "text": "Can you review this before I ship it?", "direction": "in"}
+    {"sender_name": "Alex", "text": "Can you review this before I ship it?", "direction": "in"}
   ],
   "source_chat_id": 123,
   "source_message_id": 456,
@@ -36,47 +54,23 @@ The source integration should pass this shape to `DraftRequest.from_dict()` or t
 }
 ```
 
-`target_chat_id` is required for `Approve & Send` and edited sends. Without it, the bot captures the failure and leaves the draft unsent.
+`target_chat_id` is required to actually send on approve/edit. (The live
+`approve_service.py` builds this itself from the `/draft` body — see
+[SETUP.md](../SETUP.md#bot--plugin-integration-contract).)
 
-## Commands
-
-Run the approval bot:
-
-```bash
-make bot
-```
-
-Generate a summary from stdin:
+## CLI entry points
 
 ```bash
-python -m agent.summarize < payload.json
+python -m agent.demo               # end-to-end proof (auto-pick or <chat_id> <message_id>)
+python -m agent.draft   < payload.json     # draft from a payload on stdin
+python -m agent.summarize < payload.json   # Goal/Now/Next/Open from a payload
+python -m agent.style_sheet        # regenerate the living style sheet
 ```
-
-Generate a draft from stdin:
-
-```bash
-python -m agent.draft < payload.json
-```
-
-Post one payload file on bot startup:
-
-```bash
-MIRROR_DRAFT_PAYLOAD_FILE=payload.json make bot
-```
-
-## Approval Flow
-
-1. Source integration submits a `DraftRequest`.
-2. `summarize_thread` creates `Goal / Now / Next / Open`.
-3. `draft_reply` retrieves style examples if pgvector is available, then drafts as the owner.
-4. `post_approval_request` sends the owner the summary, draft, and inline buttons.
-5. `Approve & Send` sends the draft to `target_chat_id` and persists `action=approve`.
-6. `Edit` asks the owner to send edited final text, sends that text onward, and persists `action=edit`.
-7. `Dismiss` drops the draft and persists `action=dismiss`.
 
 ## Guardrails
 
-- Never auto-send without the owner approving or sending edited final text.
-- Keep all corpus, draft, and feedback data private to the repo and VPS database.
-- Preserve the original inbound thread metadata with feedback.
-- Treat edits as high-signal training data.
+- Never auto-send without an explicit Approve or an edited final.
+- Keep corpus, draft, and feedback data private and local.
+- Treat edits as high-signal training data — but route intent changes to the
+  intent channel, never the voice channel.
+- A model draft is never a positive voice sample or a corpus row.

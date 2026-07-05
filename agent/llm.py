@@ -26,8 +26,8 @@ class LLMClient(ABC):
 class CodexLLMClient(LLMClient):
     """Drafts via GPT-5.5 through `codex exec` (stateless, on-demand).
 
-    Codex authenticates through ChatGPT OAuth (the fleet's `tawan` login), so no
-    OpenAI API key is needed. Each call is a fresh, one-shot `codex exec` — no
+    Codex authenticates through ChatGPT OAuth, so no OpenAI API key is needed.
+    Each call is a fresh, one-shot `codex exec` — no
     session is maintained between drafts (the owner's decision).
     """
 

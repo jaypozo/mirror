@@ -1,317 +1,387 @@
 # Mirror — Architecture
 
-Mirror is a private "learning model of the owner." It ingests your own Telegram
-history into a local vector store, then, when a new message arrives, retrieves
-how you replied to similar things and drafts a reply **in your voice** for you
+Mirror is a self-hosted "drafts replies in your voice, learns from your edits"
+system. It ingests your own Telegram history into a local vector store, and when
+a new message arrives it retrieves how you replied to similar things — matched on
+both **topic and writing style** — and drafts a reply **in your voice** for you
 to Approve / Edit / Dismiss. Nothing is ever sent automatically.
 
 Everything runs **on-box with no third-party API key**:
 
-- **Embeddings** are computed locally with a small sentence-transformers model.
-- **Drafting** uses GPT-5.5 through `codex exec` (authenticated via ChatGPT
-  OAuth), one fresh stateless call per draft.
+- **Embeddings** are computed locally with sentence-transformers — a *topic*
+  model (`all-MiniLM-L6-v2`, 384-dim) and a *style* model
+  (`StyleDistance/styledistance`, 768-dim).
+- **Drafting** uses GPT-5.5 through `codex exec` (ChatGPT OAuth), one fresh
+  stateless call per draft. Swappable for an OpenAI key.
 
-This document is a clean, secrets-free description of the full pipeline so
-anyone can replicate it. No API IDs, hashes, tokens, or credentials appear here.
+This document is a clean, secrets-free description of the full current pipeline so
+anyone (or their agent) can replicate it. No API ids, hashes, tokens, or
+credentials appear here.
 
 ---
 
 ## Pipeline overview
 
 ```
-                 ┌──────────────────────────────────────────────────────────┐
-   Telegram      │  PHASE 1 — CORPUS (live)                                  │
-   (your acct)   │                                                          │
-        │        │   Telethon (user login, Takeout)                         │
-        └───────►│        │                                                 │
-                 │        ▼                                                 │
-                 │   Postgres  ── messages, sync_state                      │
-                 │        │                                                 │
-                 │        ▼                                                 │
-                 │   LOCAL embeddings (sentence-transformers, 384-dim)      │
-                 │        │                                                 │
-                 │        ▼                                                 │
-                 │   pgvector  ── message_embeddings                        │
-                 └────────┼─────────────────────────────────────────────────┘
-                          │
-                 ┌────────┼─────────────────────────────────────────────────┐
-                 │  PHASE 2 — DRAFT-MY-REPLY (this build)                    │
-   incoming msg  │        ▼                                                 │
-        ────────►│   retrieve.py  ── embed query (same local model)         │
-                 │                    → pgvector KNN over YOUR 'out' replies │
-                 │        │            + surrounding thread context         │
-                 │        ▼                                                 │
-                 │   draft.py     ── build system+user prompt (few-shot)    │
-                 │        │            → GPT-5.5 via `codex exec` (stateless)│
-                 │        ▼                                                 │
-                 │   draft text  ── Approve / Edit / Dismiss (human)        │
-                 │        │            → feedback table → learn             │
-                 └────────┴─────────────────────────────────────────────────┘
+  Telegram (your USER account)
+        │  Telethon user session — sanctioned self-read (Takeout, paced, resumable)
+        ▼
+  ┌───────────────────────── INGEST (ingest/) ──────────────────────────┐
+  │  pull.py / pull_recent.py / backfill.py  →  messages  (+ sync_state) │
+  └──────────────────────────────┬──────────────────────────────────────┘
+                                 │
+        ┌────────────────────────┴─────────────────────────┐
+        ▼                                                   ▼
+  embed.py (TOPIC)                                    embed_style.py (STYLE)
+  MiniLM 384-dim, context_tag                         StyleDistance 768-dim
+        │                                                   │  (owner 'out' msgs only)
+        ▼                                                   ▼
+  message_embeddings  ◄──────── Postgres + pgvector ──────►  message_style_embeddings
+        └───────────────────────────┬───────────────────────┘
+                                    │
+  ══════════════ on an INCOMING message (approve_service /draft) ═══════════════
+                                    │
+        ┌───────────────────────────┴───────────────────────────┐
+        ▼                                                        ▼
+  threads.py                                             retrieve.py
+  segment → matched thread                               embed query (MiniLM)
+  refresh goal/current_task/stage                        → topic-nearest POOL (~40)
+  → thread-aware Goal/Now/Next                           → style-score each (StyleDistance)
+  + recent intent notes                                  → BLEND 0.6·topic + 0.4·style
+        │                                                → MMR diversity → top-6 exemplars
+        │                                                       │ (+ preceding context)
+        └───────────────────────────┬───────────────────────────┘
+                                    ▼
+                    draft.py — build prompt:
+                      [ living style sheet ]           (style_sheet.py, staged rules)
+                    + [ style/topic few-shot exemplars ]
+                    + [ recent edit-corrections ]      (style/both only — intent excluded)
+                    + [ thread state + intent notes ]
+                                    ▼
+                    stateless LLM draft  (codex exec, GPT-5.5)   llm.py
+                                    ▼
+        ┌──────────────── /draft → card → /decide loop ─────────────────┐
+        │  bot/plugin renders  Approve / Edit / Dismiss  (outside repo)  │
+        └──────────────────────────────┬────────────────────────────────┘
+                                       ▼
+              approve  → send draft AS YOU (Telethon)   ┐
+              edit     → send edited text AS YOU        ├─► feedback row (always)
+              dismiss  → send nothing                   ┘
+                                       │
+        ┌──────────────────────────────┴───────────────────────────────┐
+        ▼                              ▼                                ▼
+  corpus.py::add_owner_sample   edit_classify.py               threads.py
+  FINAL text → messages +       style|intent|both|trivial      record_intent_note
+  topic + style embeddings      → routes learning:             (intent/both edits)
+  (real id; draft NEVER)          style→voice, intent→intent
 ```
+
+The **draft is never a training sample** and never enters `messages` or either
+embedding table (see [Real-samples-only](#real-samples-only-a-draft-is-never-a-sample)).
 
 ---
 
 ## Data store (Postgres + pgvector)
 
-Full DDL is in [`db/schema.sql`](db/schema.sql). Key tables:
+Full DDL and per-column detail is in [`db/schema.sql`](db/schema.sql) and
+[DATA.md](DATA.md). The tables:
 
-**`messages`** — one row per Telegram message.
-
-| column | meaning |
+| table | what it holds |
 | --- | --- |
-| `chat_id`, `id` | composite primary key |
-| `chat_title`, `sender_id`, `sender_name` | who/where |
-| `text` | message body |
-| `ts` | timestamp |
-| `direction` | `'in'` (received) or `'out'` (**your own** messages) |
-| `reply_to_id` | threading |
-| `raw` | full original payload (jsonb) |
+| `messages` | one row per Telegram message; `direction` = `'out'` (yours) / `'in'` (received). PK `(chat_id, id)`. |
+| `sync_state` | per-chat forward cursor (`last_message_id`) — incremental, resumable ingest. |
+| `message_embeddings` | **TOPIC** vector `vector(384)` per message + `context_tag`. PK `(chat_id, message_id, context_tag)`. |
+| `message_style_embeddings` | **STYLE** vector `vector(768)` — *how* an owner message is written, content-independent. Owner real messages only. PK `(chat_id, message_id)`. |
+| `feedback` | every Approve / Edit / Dismiss decision + `original_draft`, `final_text`, `edit_kind`, `edit_note`. The learning signal. |
+| `threads` | per-thread `goal` / `current_task` / `stage` + `anchors` + `anchor_embedding vector(384)`. |
+| `intent_notes` | durable decisions captured from intent/both edits, tied to a thread + feedback row. |
+| `style_sheet` | the living distilled "how the owner writes" guide (`guide_md` + measured `rubric`); newest `active` row is injected into every draft. |
+| `style_rules` | candidate correction rules mined from edits; `candidate → active` only after ≥ `STYLE_RULE_PROMOTE_THRESHOLD` independent edits; decay out on misses. |
 
-**`sync_state`** — per-chat cursor (`last_message_id`) so ingestion is
-incremental and resumable.
-
-**`message_embeddings`** — one embedding per message.
-
-| column | meaning |
-| --- | --- |
-| `chat_id`, `message_id`, `context_tag` | composite primary key |
-| `embedding` | `vector(384)` — matches the local model |
-| `context_tag` | coarse bucket: `general`, `code-review`, `planning`, `cs`, `personal` |
-| `provider`, `model` | provenance (e.g. `local`, `all-MiniLM-L6-v2`) |
-
-> **Dimension note:** the vector column is `vector(384)` to match
-> `sentence-transformers/all-MiniLM-L6-v2`. If you swap embedding models, change
-> `384` to the new model's dimension and re-embed. The table must be empty to
-> `ALTER` an existing vector length.
-
-**`feedback`** — every Approve / Edit / Dismiss decision, with the original
-draft and the final text. This is the training signal for the "learn" step.
+> **Dimension note:** `message_embeddings.embedding` is `vector(384)` to match
+> `all-MiniLM-L6-v2`; `message_style_embeddings.embedding` is `vector(768)` to
+> match StyleDistance. Swapping either model means changing that dimension and
+> re-embedding — the table must be empty to `ALTER` an existing vector length.
 
 ---
 
-## Phase 1 — Corpus ingestion
+## Phase 1 — Corpus ingestion (`ingest/`)
 
-- **Telethon logs in as your own user account** (not a bot) and reads your
-  history. This is the sanctioned path for reading *your own* data — see the
-  safety notes below.
-- Ingestion uses **Telegram Takeout** and paces itself (batch size + sleeps
-  between batches and chats) to stay well under rate limits, and is
-  **resumable** via `sync_state`.
-- Rows land in `messages`; `direction` distinguishes messages you sent
-  (`'out'`) from messages you received (`'in'`).
+All pullers use a **Telethon USER session** (your own account — a bot cannot read
+account history). The `.telethon/*.session` is a single-writer SQLite file, so
+**only one puller may run at a time** (the run scripts enforce this).
 
-Entry points: `ingest/pull.py` (full history) and `ingest/pull_recent.py`
-(incremental catch-up). These are not covered in detail here because the corpus
-is already live.
+- **`ingest/pull.py`** — forward/full history. Iterates all dialogs with
+  `iter_messages(min_id=cursor, reverse=True)` (only messages newer than the
+  cursor, oldest-first). First run performs the interactive login.
+- **`ingest/pull_recent.py`** — windowed catch-up of the last `PULL_SINCE_HOURS`.
+  Runs inside a **Telegram Takeout** session (official export mode, lower flood
+  limits); `connect()`-only and **refuses if the session isn't already
+  authorized**.
+- **`ingest/backfill.py`** — older history. Walks strictly-older pages per dialog
+  (`offset_id = min(id)` already stored) so it reaches history behind the forward
+  cursor. Resumable with no extra schema — `messages` is the cursor.
+
+Pacing: batches of `PULL_BATCH_SIZE`, sleeps between batches/chats, and
+`FloodWaitError → sleep-and-resume`. Upserts are `ON CONFLICT DO UPDATE`
+(idempotent).
 
 ---
 
 ## Local embeddings
 
-[`ingest/embed.py`](ingest/embed.py) walks every message with text that isn't
-already embedded, encodes it, and upserts into `message_embeddings`.
+Two independent indexes are built from the corpus:
 
-Providers are pluggable behind `EmbeddingProvider`:
+**TOPIC — [`ingest/embed.py`](ingest/embed.py).** Walks every message with text
+and no embedding yet, assigns a coarse `context_tag` (`code-review`, `planning`,
+`cs`, `personal`, else `general`), and encodes via the provider from
+`EMBEDDING_PROVIDER`:
 
-- **`local`** (default) — `LocalEmbeddingProvider`, sentence-transformers,
-  `all-MiniLM-L6-v2`, 384-dim, L2-normalized. CPU-only, no network, no key.
-  Encoding runs off the event loop via `asyncio.to_thread`.
-- `openai` — kept as an option (needs a key); imported lazily so the module
-  runs fine without the `openai` package or a key.
-- `dry-run` — zero vectors, for wiring tests.
+- **`local`** (default) — `all-MiniLM-L6-v2`, 384-dim, L2-normalized, CPU, off the
+  event loop. No network / key.
+- `openai` — optional, needs `EMBEDDING_API_KEY`.
+- `dry-run` — zero vectors for wiring tests.
 
-Selected by `EMBEDDING_PROVIDER`. Run it with:
+**STYLE — [`ingest/embed_style.py`](ingest/embed_style.py) + [`agent/style_embed.py`](agent/style_embed.py).**
+Embeds **only the owner's own messages** (`direction='out'`) into a
+content-independent style space that captures *how* a message is written (length,
+register, punctuation, casing, formality) rather than its subject. Two
+interchangeable local embedders, chosen by `STYLE_RETRIEVAL_MODE`
+(`auto` | `model` | `features` | `off`):
 
-```bash
-.venv/bin/python -m ingest.embed
-```
+- **`StyleModelEmbedder`** (preferred) — `STYLE_EMBED_MODEL` (default
+  `StyleDistance/styledistance`), 768-dim, normalized, on-box, no key. Fills
+  `message_style_embeddings`.
+- **`StyleFeatureEmbedder`** (fallback) — a normalized stylometric feature vector
+  (the same primitives the style sheet measures), used on the fly if the model
+  can't load offline. Never persisted; style retrieval never hard-fails.
 
-Re-running is safe and idempotent — it only embeds messages that don't yet have
-a row (and upserts on conflict).
-
----
-
-## Retrieval
-
-[`agent/retrieve.py`](agent/retrieve.py) — given a query (the incoming message):
-
-1. Embeds the query with **the same local model** used at ingest time.
-2. Runs a pgvector nearest-neighbour search (cosine distance, `<=>`, over
-   normalized vectors) over `message_embeddings`, **restricted to your own
-   replies** (`direction = 'out'`), optionally filtered by `context_tag`.
-3. For each hit, also pulls the few messages immediately preceding it, so the
-   drafter sees *what you were replying to*, not just the reply in isolation.
-
-Returns the top-K `RetrievedExample`s — real few-shot examples of your voice.
-`RETRIEVE_TOP_K` controls K (default 6).
-
-```bash
-.venv/bin/python -m agent.retrieve "can you get that done by tomorrow?"
-```
+Both embed passes are idempotent and resumable. Run: `make embed` and
+`make embed-style`.
 
 ---
 
-## Drafting (GPT-5.5 via codex exec)
+## Retrieval — [`agent/retrieve.py`](agent/retrieve.py) (TOPIC + STYLE + MMR)
 
-[`agent/draft.py`](agent/draft.py) + the `CodexLLMClient` in
-[`agent/llm.py`](agent/llm.py).
+At draft time Mirror retrieves the owner's own past replies as few-shot voice
+examples, **always restricted to `direction='out'`** (genuine owner replies —
+never a draft). `retrieve_examples(query, ...)`:
 
-For each incoming message:
+1. **Over-fetch** a topic-nearest candidate pool (`STYLE_CANDIDATE_POOL`, default
+   40) from `message_embeddings JOIN messages LEFT JOIN message_style_embeddings`,
+   ordered by pgvector cosine (`<=>`), optional `context_tag` filter.
+2. **Style-score** each candidate: embed the incoming message's register with the
+   style embedder; `style_sim` = style-cosine to it (candidates without a stored
+   style vector are embedded on the fly).
+3. **Blend**: `base = STYLE_BLEND_TOPIC_WEIGHT·(1−dist) +
+   STYLE_BLEND_STYLE_WEIGHT·style_sim` (defaults 0.6 / 0.4).
+4. **MMR** (`STYLE_MMR_LAMBDA`, default 0.7) over the candidates' style vectors —
+   greedily pick high-`base` exemplars while penalizing ones stylistically
+   near-identical to those already picked, so the returned `top_k`
+   (`RETRIEVE_TOP_K`, default 6) spans different lengths/registers.
+5. For each pick, pull the up-to-3 preceding messages so the drafter sees *what
+   you were replying to*.
 
-1. `retrieve_examples()` fetches top-K of your similar past replies + context.
-2. A prompt is built:
-   - **system:** *"You are drafting the owner's reply in their voice and style. Here
-     are real examples of how they reply… Match their tone, length, directness.
-     Output only the reply text."*
-   - **user:** the retrieved examples, optional thread context, then the
-     incoming message.
-3. **One fresh, stateless `codex exec` call** produces the draft. No session is
-   maintained between drafts (a deliberate choice — every draft starts clean).
-
-The exact non-interactive invocation (from `CodexLLMClient`):
-
-```bash
-codex exec --skip-git-repo-check -s read-only \
-  -m gpt-5.5 -c model_reasoning_effort=high \
-  -o <tmpfile> "<prompt>"   # stdin closed; final message read from <tmpfile>
-```
-
-`codex` authenticates via ChatGPT OAuth, so **no OpenAI API key is required**.
-`-o/--output-last-message` captures just the model's final message; stdin is
-closed so `codex` doesn't wait on it. On failure or timeout the drafter falls
-back to a short heuristic reply rather than crashing.
-
-Providers are selected by `LLM_PROVIDER` (`codex` | `openai` | `dry-run`).
+Fully guarded: if the style embedder is unavailable or errors, it degrades to the
+original **topic-only** nearest-neighbour order (the pool is already topic-sorted),
+so drafting never breaks.
 
 ---
 
-## Demo (end-to-end proof)
+## Drafting — [`agent/draft.py`](agent/draft.py) + [`agent/llm.py`](agent/llm.py)
 
-[`agent/demo.py`](agent/demo.py) picks a real inbound message from the corpus
-(or one you pass), loads its thread, retrieves your similar past replies, drafts
-a reply as you, and prints the examples + the draft.
+`draft_reply()`:
 
-```bash
-.venv/bin/python -m agent.demo                          # auto-pick recent inbound
-.venv/bin/python -m agent.demo <chat_id> <message_id>   # target a specific message
-```
+1. Query = the incoming message (+ a tail of the last 3 thread messages as extra
+   semantic anchor).
+2. `retrieve_examples()` → top-K owner replies + their context.
+3. **Thread-aware state** ([`agent/threads.py`](agent/threads.py)): the message is
+   segmented to its best-matching thread; goal/current_task/stage are refreshed,
+   and a thread-aware Goal/Now/Next is produced. This one LLM call **replaces** the
+   flat `agent/summarize.py` call (it doesn't add to it). The matched thread's
+   state + recent intent notes are injected into the draft prompt. Falls back to
+   the flat summary if segmentation fails. An agent-supplied summary is honored.
+4. Prompt = a **system** prompt (*"draft the owner's reply in their voice; match
+   tone/length/directness; output ONLY the reply; don't reveal AI; don't invent
+   facts; don't copy examples verbatim"*) + the **living style sheet** + a **user**
+   prompt (the retrieved exemplars, optional thread transcript, then "Now draft the
+   reply to this incoming message: …").
+5. One LLM call; on any error, a tiny heuristic fallback.
 
-Sample output (real corpus message, abridged):
-
-```
-TARGET: "Never thrown anything up on ProductHunt, but why not — <link>.
-         Go upvote for me so I can see how their analytics dashboard works"
-DRAFT (as the owner): "Yeah I'll upvote. Send me what the analytics dashboard looks like"
-```
-
----
-
-## Approve / Edit / Dismiss + learning (LIVE)
-
-> **Now built.** The approval flow ships as the headless HTTP service
-> `agent/approve_service.py` (`/draft`, `/decide`, `/health`), driven by the fleet
-> Telegram bots' shared plugin. A flagged reply renders an **Approve / Edit /
-> Dismiss** card with a `Goal / Now / Next` blockquote (the sending agent supplies
-> that context) and a drafted reply; Approve sends it **as the owner** via the
-> Telethon session. Full details in **[DATA.md](DATA.md)** §6. The description
-> below is the original design note.
-
-The draft core is done and proven. The remaining follow-up is the Telegram
-approval **bot/service** that shows each draft with **Approve & Send**, **Edit**,
-**Dismiss** buttons plus a `Goal / Now / Next / Open` summary (scaffolded in
-`agent/bot.py`, `agent/summarize.py`, `agent/feedback.py`). Every decision is
-written to the `feedback` table:
-
-- **Approve** → send the reply, log it as a positive example.
-- **Edit** → log original vs. final; the diff is the strongest learning signal.
-- **Dismiss** → log the negative.
-
-Over time this feedback tightens the retrieved examples and a running style
-profile. That bot runtime is intentionally **not** built yet.
+**LLM backends** (`LLM_PROVIDER`): **`codex`** (default) shells out to
+`codex exec --skip-git-repo-check -s read-only -m gpt-5.5 -c
+model_reasoning_effort=high`, reads the final message from a temp file, 300s
+timeout, ChatGPT OAuth → **no OpenAI API key** (~13s typical). Also `openai`
+(needs a key) and `dry-run`.
 
 ---
 
-## `.env` template (keys only)
+## The living style sheet — [`agent/style_sheet.py`](agent/style_sheet.py)
 
-Copy `.env.example` to `.env` and fill in your own values. **No secrets belong
-in git.**
+A distilled, always-injected "how the owner writes" guide, persisted in
+`style_sheet` and regenerated periodically (not per-draft). One LLM call turns
+(a) a measured stylometric profile over a corpus sample, (b) a sample of real
+owner messages, and (c) accumulated edits into a short markdown guide plus
+candidate correction rules.
 
-```
-# Telegram (your USER account — Telethon)
-TELEGRAM_API_ID=
-TELEGRAM_API_HASH=
-TELEGRAM_SESSION=.telethon/mirror
-
-# Postgres + pgvector
-DATABASE_URL=postgresql://USER:PASSWORD@HOST:PORT/DBNAME
-
-# Embeddings — local, no key needed
-EMBEDDING_PROVIDER=local
-EMBEDDING_MODEL=sentence-transformers/all-MiniLM-L6-v2
-EMBEDDING_API_KEY=
-EMBED_BATCH_SIZE=100
-
-# Drafting — GPT-5.5 via codex exec (ChatGPT OAuth, no key needed)
-LLM_PROVIDER=codex
-LLM_MODEL=gpt-5.5
-LLM_API_KEY=
-CODEX_REASONING_EFFORT=high
-
-# Retrieval
-STYLE_EXAMPLE_LIMIT=5
-STYLE_EMBEDDING_MODEL=sentence-transformers/all-MiniLM-L6-v2
-STYLE_EMBEDDING_API_KEY=
-RETRIEVE_TOP_K=6
-
-# Approval bot (follow-up, not built yet)
-TELEGRAM_BOT_TOKEN=
-OWNER_APPROVAL_CHAT_ID=
-```
+**Staged rule promotion (anti-overfit):** a single edit is noise; a *pattern* is
+signal. Mined rules stage in `style_rules` — a candidate graduates into the active
+guide only after **≥ `STYLE_RULE_PROMOTE_THRESHOLD` (default 3) independent
+edits** support it (support = distinct `feedback.id`); one-offs stay `candidate`;
+promoted rules that stop recurring accrue `misses` and `decay` out. Regenerate on
+demand with `python -m agent.style_sheet`, or install the daily
+[`deploy/systemd/`](deploy/systemd/) timer.
 
 ---
 
-## Setup & run
+## Edit learning — [`agent/edit_classify.py`](agent/edit_classify.py) + [`agent/feedback.py`](agent/feedback.py)
 
-```bash
-# 1. Python env + deps
-python -m venv .venv
-.venv/bin/pip install -r requirements.txt          # includes sentence-transformers
+Every Approve / Edit / Dismiss decision is written to `feedback`. Edits are the
+strongest single learning signal — the delta between what Mirror drafted and what
+you actually sent is a direct correction.
 
-# 2. Postgres with pgvector, then apply the schema
-psql "$DATABASE_URL" -f db/schema.sql
+**Dual learning.** Not every edit is a voice correction. At capture (the `/decide`
+edit path, after the send already succeeded, fully guarded) a lightweight LLM
+classifies `original_draft` vs `final_text` into `style | intent | both | trivial`
+with a one-line note (`edit_kind`, `edit_note`). Learning is then **routed**:
 
-# 3. Fill in .env (see template above) and complete the one-time Telethon login
+- **STYLE / BOTH → the voice channel.** `fetch_recent_edits` (draft-time voice
+  corrections, ranked by recency + edit magnitude, capped) and the style-sheet
+  rule miner both filter to `edit_kind IN ('style','both')` ∪ NULL and **exclude
+  pure `intent`** — a decision change never trains voice.
+- **INTENT / BOTH → the intent channel.** The note is stored as a durable
+  `intent_notes` row tied to the feedback row and the matched thread, so future
+  summaries + drafts honor what you actually decided.
 
-# 4. Ingest your history (paced, resumable)
-.venv/bin/python -m ingest.pull                    # full history
-.venv/bin/python -m ingest.pull_recent             # incremental catch-up
+A classify/DB failure degrades to a local heuristic and never blocks capture or
+sending.
 
-# 5. Embed locally
-.venv/bin/python -m ingest.embed
+---
 
-# 6. Prove the draft pipeline
-.venv/bin/python -m agent.demo
-```
+## Thread-aware goal state — [`agent/threads.py`](agent/threads.py)
 
-Requires: a working local Postgres with the `vector` extension, and the `codex`
-CLI authenticated (for drafting).
+You run multiple threads interleaved in one conversation; a flat window of the
+last N messages can't tell which thread a message belongs to. Mirror segments each
+incoming message to its best-matching **active thread** (or opens a new one) and
+maintains per-thread `goal`, `current_task`, and `stage`
+(`mid-step | awaiting-owner | done`):
+
+1. Embed the incoming message locally and **pre-rank** candidate threads by cosine
+   distance to their stored `anchor_embedding` (falling back to most-recently
+   updated).
+2. **One LLM call** does segmentation + state update + summary together, given the
+   message, recent thread, candidate threads, and the matched thread's recent
+   intent notes. This call **replaces** the flat `summarize_thread` call, so the
+   hot path stays ~one exec for the reply + one for state.
+3. The matched thread's state + recent decisions are injected into the draft
+   prompt, and the thread-aware summary becomes the card's Goal / Now / Next.
+
+Guarded — returns `None` on failure so drafting falls back to the flat summary.
+
+---
+
+## The `/draft → card → /decide` loop — [`agent/approve_service.py`](agent/approve_service.py)
+
+A headless aiohttp service on loopback (`MIRROR_APPROVE_HOST` default
+`127.0.0.1`, `MIRROR_APPROVE_PORT` default `8791`). Your bot/plugin renders the
+draft card; this service does the drafting and is the **only** thing that sends as
+you. It opens the Telethon USER client with `.connect()` only, **refuses if not
+already authorized** (never logs in), and verifies the session owner is
+`MIRROR_OWNER_USER_ID`. Every request must carry header `X-Mirror-Secret` ==
+`MIRROR_APPROVE_SECRET` (**fail closed** — no secret configured means refuse
+everything).
+
+Endpoints (full request/response shapes in [SETUP.md](SETUP.md#bot--plugin-integration-contract)):
+
+- **POST `/draft`** — drafts, stores a pending keyed by a 12-hex `approval_id`
+  (TTL 1h), returns `{ok, approval_id, draft, summary}`. Refuses the excluded
+  group's topic threads and empty questions.
+- **POST `/decide`** — `{approval_id, action: approve|edit|dismiss, edited_text?}`.
+  `approve`/`edit` send **as the owner**; all three write a `feedback` row. On a
+  successful send the FINAL text is added to the topic+style corpus
+  (`corpus.py::add_owner_sample`); on `edit`, `classify_edit` sets the edit kind
+  and an intent/both edit writes an `intent_notes` row. Classification / corpus /
+  DB failures are swallowed — never fail the request.
+- **GET `/health`** — `{ok, session_owner, pending}`.
+
+**Warm-up gate.** On boot, before the HTTP site binds, `_warm_up()` eager-loads
+the topic encoder and the style embedder (the same lazy heavy init the draft path
+uses). `/draft` and `/decide` gate on a `READY` event, so a request that somehow
+arrives cold **waits** instead of running against an unloaded pipeline. This fixes
+the "first draft after a restart is slow, the caller times out, and its 0-byte
+`200` looks like an empty reply" failure.
+
+**Pending persistence.** Pending drafts are mirrored to disk
+(`MIRROR_PENDING_STORE`, default `logs/pending.pkl`) so an undecided card survives
+a restart (otherwise Approve would silently no-op). On `/decide` for a pending
+that no longer exists, the service returns an unambiguous **HTTP 410** so the
+plugin can tell a lost/expired draft from a normal decline and offer a fresh one.
+
+**Send-as-owner** is the only path that touches a chat: it sends via the Telethon
+user session and **returns the sent Message** (so its real id can be indexed).
+Because a bot DM's API `chat_id` equals the owner's own user id (which would route
+to Saved Messages), for positive `chat_id`s it addresses the bot by `bot_username`
+instead; groups (negative `chat_id`) send as-is; if a threaded `reply_to` fails
+(bot-API vs user-session id mismatch) it retries without threading so the message
+still lands inline.
+
+> The card UI itself lives **outside this repo** — a Telegram bot plugin that
+> POSTs `/draft` and renders an HTML card (blockquote Goal/Now/Next + the draft),
+> then POSTs `/decide` on a button tap. Document/build against the contract in
+> [SETUP.md](SETUP.md), not against plugin code. `agent/service.py` is a sibling
+> variant that drives its own Mirror-bot DM as the approval UI;
+> `agent/bot.py`/`agent/demo.py` are a legacy scaffold and an end-to-end demo.
+
+---
+
+## Design choices
+
+- **Why style embeddings ≠ topic embeddings.** Topic vectors (MiniLM) find
+  *what* you talked about; they don't guarantee the exemplar is written *how* you
+  write. Authorship is captured by content-independent features (function words,
+  punctuation, sentence-length variance) — so a second, style-representation index
+  (StyleDistance) lets exemplar selection optimize for voice, and the blend picks
+  replies that mirror the incoming register. See [PRD.md](PRD.md).
+- **Why edits split style vs intent.** Training one "prefer this" channel on all
+  edits is wrong: if you change a *decision* (a number, a commitment), that's not a
+  phrasing rule. Classifying the edit routes substance changes to durable decision
+  notes and keeps them out of the voice signal.
+- **Why the draft is never a training sample.** Only text you actually sent is
+  genuine you. A model draft could drift the corpus toward the model's own voice,
+  so it is never embedded or retrievable; it survives only as the "before" side of
+  a contrastive edit-correction.
+- **Why warm-up + pending persistence.** The draft path lazily loads heavy models;
+  a cold first draft after a restart outran the caller's timeout. Warm-up moves
+  that cost before the socket opens; persisting pendings means a restart mid-card
+  doesn't turn Approve into a silent no-op (it returns a clean 410 instead).
+
+---
+
+## Real-samples-only: a draft is never a sample
+
+The exemplar corpus — both the topic and style index — contains **only the
+owner's real messages**: ingested history (`direction='out'`) plus
+**approved/edited finals**. An approved/edited final is added to `messages` + both
+embedding tables **at decide-time** by
+[`agent/corpus.py::add_owner_sample`](agent/corpus.py), keyed by the **real
+Telegram message id** (so a later ingest of the same id is an idempotent no-op) —
+making your just-sent reply a retrievable exemplar immediately. The model's
+`original_draft` is **never** inserted into `messages` or either embedding table;
+it survives only as the "before" of a contrastive edit-correction.
 
 ---
 
 ## Safety notes
 
 - **Reading your own history is the sanctioned path.** Telethon logs in as your
-  own account with your own API credentials to read messages you already have
-  access to. Keep the corpus private and local.
-- **Use Telegram Takeout and pace ingestion.** Takeout plus batch/chat sleeps
-  keep you comfortably within rate limits and avoid tripping account flags. Keep
-  the pull incremental and resumable via `sync_state`.
+  own account with your own API credentials to read messages you already have. Use
+  Takeout and pace ingestion (batch/chat sleeps, `FloodWait` handling); keep it
+  incremental/resumable via `sync_state`. Keep the corpus private and local.
 - **Nothing is sent automatically.** Every outbound reply is gated behind an
-  explicit human Approve. Edit and Dismiss are equally first-class.
-- **No secrets in git.** `.env` and `.telethon/` (session + credentials) are
-  gitignored. This document and `.env.example` contain **keys only, never
-  values**.
-- **Fully local models.** Embeddings and drafting run on-box with no third-party
-  API key, so your corpus never leaves the machine for a hosted embedding or
-  chat API.
-```
+  explicit Approve or Edit; the service is loopback-only, shared-secret gated, and
+  single-owner.
+- **No secrets in git.** `.env`, `.telethon/` (session + credentials), `logs/`,
+  and DB dumps are gitignored. This document and `.env.example` contain **names
+  only, never values**.
+- **Fully local models.** Embeddings and drafting run on-box, so your corpus never
+  leaves the machine for a hosted embedding or chat API.

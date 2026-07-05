@@ -13,8 +13,9 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-User=tawan
-Environment=HOME=/home/tawan
+# Replace the user and paths below with your own before installing.
+User=youruser
+Environment=HOME=/home/youruser
 Environment=PYTHONUNBUFFERED=1
-WorkingDirectory=/home/tawan/work/mirror/feat/phase1-corpus
-ExecStart=/home/tawan/work/mirror/feat/phase1-corpus/.venv/bin/python -m agent.style_sheet
+WorkingDirectory=/home/youruser/mirror
+ExecStart=/home/youruser/mirror/.venv/bin/python -m agent.style_sheet

@@ -78,7 +78,7 @@ STATE: ServiceState | None = None
 
 
 # --------------------------------------------------------------------------- #
-# Approve-UI rendering (mirrors Naveed's Shade Goal/Now/Next/Open card).
+# Approve-UI rendering (a Goal/Now/Next/Open card).
 # --------------------------------------------------------------------------- #
 def _truncate(text: str, limit: int = 500) -> str:
     text = text.strip()
