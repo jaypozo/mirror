@@ -52,6 +52,17 @@ FOREIGN KEY → `messages(chat_id, id)` ON DELETE CASCADE. Indexes on `context_t
 and `embedded_at`. The `384` dimension matches `all-MiniLM-L6-v2`; swapping models
 means changing the dim and re-embedding (the table must be empty to ALTER it).
 
+### `message_style_embeddings` — one content-independent STYLE vector per owner message
+`chat_id`, `message_id`, `embedding vector(768)`, `model`, `embedded_at`. PRIMARY
+KEY `(chat_id, message_id)`, FOREIGN KEY → `messages(chat_id, id)` ON DELETE
+CASCADE. Distinct from `message_embeddings` (TOPIC): this captures **how** a
+message is written — length, register, punctuation, casing, formality —
+independent of subject. Produced by a local style model (**StyleDistance**,
+768-dim; `agent/style_embed.py`). Only the owner's **real** messages are embedded
+here (sent history + approved/edited finals); a model **draft is never** written.
+Swapping the style model means changing `768` and re-embedding. Backfill with
+`python -m ingest.embed_style` (`make embed-style`).
+
 ### `feedback` — every Approve / Edit / Dismiss decision (the learning signal)
 `id` PK, `original_draft`, `final_text` (null on dismiss), `action` CHECK IN
 ('approve','edit','dismiss'), `ts`, `source_chat_id`/`source_message_id` (the
@@ -142,24 +153,72 @@ Shared mapping (`ingest/pull.py`): `message_row()` → the `messages` tuple;
   - **`openai`** — needs `EMBEDDING_API_KEY` (default `text-embedding-3-small`).
   - **`dry-run`** — zero vectors for wiring tests.
   Upserts into `message_embeddings` (idempotent). Run: `python -m ingest.embed`.
+- **`ingest/embed_style.py`** — STYLE backfill. Selects the owner's own messages
+  (`direction='out'`, non-empty) with no `message_style_embeddings` row yet
+  (oldest-first, `STYLE_EMBED_BATCH_SIZE` default 128, optional
+  `STYLE_BACKFILL_LIMIT` cap), embeds them with the active style embedder
+  (`agent/style_embed.py`), and upserts 768-dim vectors. Idempotent/resumable;
+  exits cleanly (touching nothing) if the style model can't load. Run:
+  `python -m ingest.embed_style` (`make embed-style`).
+
+### Style embedder — `agent/style_embed.py`
+Produces the content-independent STYLE vector. Two interchangeable **local**
+embedders, chosen at runtime by `STYLE_RETRIEVAL_MODE` (`auto` default | `model` |
+`features` | `off`):
+- **`StyleModelEmbedder`** (preferred) — `STYLE_EMBED_MODEL` (default
+  `StyleDistance/styledistance`), a sentence-transformers style model, 768-dim,
+  normalized, on-box, no key. This is what fills `message_style_embeddings`.
+- **`StyleFeatureEmbedder`** (fallback) — a normalized stylometric feature vector
+  reusing `agent/style_sheet.py`'s feature primitives (length, sentence shape,
+  punctuation, casing, contractions, emoji, function-word rate). Used on the fly
+  if the model can't load offline (not persisted; dim differs from the column).
+`get_style_embedder()` caches the choice; `embed_style(texts)` returns
+`(vectors, embedder)` and never raises — a failure degrades to topic-only
+retrieval. The model is preloaded at approve-service warm-up.
 
 ---
 
-## 3. Retrieval — `agent/retrieve.py`
+## 3. Retrieval — `agent/retrieve.py` (TOPIC + STYLE + MMR blend)
 
-At draft time, retrieves the owner's own past replies as few-shot voice examples.
-`embed_query()` embeds the incoming message with the **same local model** used at
-ingest (cached encoder). `retrieve_examples(query, top_k, context_tag,
-context_window=3)` runs a KNN query over `message_embeddings` JOIN `messages`,
-**restricted to `direction='out'`** (genuine owner replies only), optional
-`context_tag` filter, `ORDER BY embedding <=> $1` (pgvector cosine distance over
-normalized vectors), `LIMIT top_k` (`RETRIEVE_TOP_K`, default 6). For each hit it
-also pulls the up-to-3 preceding messages so the drafter sees what was being
-replied to. No distance threshold — it takes the top-K nearest. Fully local.
+At draft time, retrieves the owner's own past replies as few-shot voice examples,
+**always restricted to `direction='out'`** (genuine owner replies only — never a
+draft). `embed_query()` embeds the incoming message with the **same local MiniLM**
+used at ingest (cached encoder). `retrieve_examples(query, top_k, context_tag,
+context_window=3, style_query_text=None)`:
+
+1. **Over-fetch** a topic-nearest candidate pool (`STYLE_CANDIDATE_POOL`, default
+   40) from `message_embeddings` JOIN `messages` LEFT JOIN
+   `message_style_embeddings`, `ORDER BY embedding <=> $1` (pgvector cosine),
+   optional `context_tag` filter.
+2. **Style-score** each candidate: embed the incoming message's register
+   (`style_query_text`, the raw incoming message) with the style embedder; each
+   candidate's `style_sim` = style-cosine to it (candidates missing a stored style
+   vector are embedded on the fly).
+3. **Blend**: `base = STYLE_BLEND_TOPIC_WEIGHT·(1−dist) +
+   STYLE_BLEND_STYLE_WEIGHT·style_sim` (defaults 0.6 / 0.4).
+4. **MMR** (`STYLE_MMR_LAMBDA`, default 0.7) over the candidates' style vectors:
+   greedily pick high-`base` exemplars while penalizing ones stylistically
+   near-identical to those already picked — so the returned `top_k`
+   (`RETRIEVE_TOP_K`, default 6) spans different lengths/registers.
+5. For each pick, pull the up-to-3 preceding messages for context.
+
+Guarded: if the style embedder is unavailable or errors, it degrades to the
+original **topic-only** nearest-neighbour order (the pool is already topic-sorted),
+so drafting never breaks. Fully local.
 
 > `agent/style.py` is a separate legacy/optional RAG hook doing similar retrieval
 > via OpenAI embeddings; it degrades to `[]` without a key. `retrieve.py` is the
 > one used by the live pipeline.
+
+### Real-sample-only rule (corpus integrity)
+The exemplar corpus (both indexes) contains **only the owner's real messages**.
+Approved/edited **finals** are added to `messages` + both embedding tables at
+decide-time by `agent/corpus.py::add_owner_sample`, keyed by the real Telegram
+message id (so a later ingest of the same id is an idempotent no-op) — making the
+owner's just-sent reply a retrievable exemplar immediately. The model's
+`original_draft` is **never** inserted into `messages` or either embedding table;
+it survives only as the "before" of a contrastive edit-correction
+(`fetch_recent_edits`, `style_sheet`), never as a voice exemplar.
 
 ---
 
@@ -245,12 +304,16 @@ Endpoints:
   sends nothing. All three write a `feedback` row. On `edit`, after the send
   succeeds, a guarded `classify_edit` sets `edit_kind`/`edit_note`; an
   `intent`/`both` edit also writes an `intent_notes` row against the draft's
-  matched thread (`DraftResult.thread_id`). Classification/DB failures are
-  swallowed — never fail the request.
+  matched thread (`DraftResult.thread_id`). After a successful send, the FINAL
+  text (approved or edited) is added to the retrievable topic+style corpus by
+  `agent/corpus.py::add_owner_sample` (real message id; the draft is never
+  indexed). Classification / corpus / DB failures are swallowed — never fail the
+  request.
 - **GET `/health`** — `{ok, session_owner, pending}`.
 
 **Send-as-owner** (`send_as_owner`, the only path that touches a chat): sends via
-the Telethon user session. Because a bot DM's API `chat_id` equals the owner's own
+the Telethon user session and **returns the sent Message** (so its real id can be
+indexed into the corpus). Because a bot DM's API `chat_id` equals the owner's own
 user id (which would route to **Saved Messages**), for positive chat_ids it
 addresses the bot by `bot_username` instead; groups (negative chat_id) send as-is;
 if a threaded `reply_to` fails (bot-API vs user-session id mismatch) it retries
@@ -272,7 +335,8 @@ scaffold and an end-to-end demo.
 ## 7. Scripts, commands, environment
 
 **`Makefile`**: `schema` (apply `db/schema.sql`), `pull` (`ingest.pull`), `embed`
-(`ingest.embed`), `bot` (`agent.bot`), `check` (compileall).
+(`ingest.embed`, topic), `embed-style` (`ingest.embed_style`, style), `bot`
+(`agent.bot`), `check` (compileall).
 
 **Run scripts** (all `start|stop|status`, `setsid nice`, pid+log under `logs/`,
 and all coordinate the single Telethon session):
@@ -282,14 +346,16 @@ and all coordinate the single Telethon session):
   preflights that `MIRROR_APPROVE_SECRET` is set).
 
 **`requirements.txt`**: `asyncpg`, `openai`, `pgvector`, `python-telegram-bot`,
-`python-dotenv`, `telethon`, `sentence-transformers`.
+`python-dotenv`, `telethon`, `sentence-transformers` (pulls `transformers` +
+`torch`, used by both the MiniLM topic model and the StyleDistance style model).
 
 **Environment variable names** (values live only in `.env`; see `.env.example`):
 - Telegram user session: `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`, `TELEGRAM_SESSION`
 - Database: `DATABASE_URL`
-- Embeddings: `EMBEDDING_PROVIDER`, `EMBEDDING_MODEL`, `EMBEDDING_API_KEY`, `EMBED_BATCH_SIZE`
+- Embeddings (topic): `EMBEDDING_PROVIDER`, `EMBEDDING_MODEL`, `EMBEDDING_API_KEY`, `EMBED_BATCH_SIZE`
 - Drafting: `LLM_PROVIDER`, `LLM_MODEL`, `LLM_API_KEY`, `CODEX_REASONING_EFFORT`, `OPENAI_API_KEY`
 - Retrieval: `STYLE_EXAMPLE_LIMIT`, `STYLE_EMBEDDING_MODEL`, `STYLE_EMBEDDING_API_KEY`, `RETRIEVE_TOP_K`
+- Style retrieval: `STYLE_RETRIEVAL_MODE`, `STYLE_EMBED_MODEL`, `STYLE_BLEND_TOPIC_WEIGHT`, `STYLE_BLEND_STYLE_WEIGHT`, `STYLE_MMR_LAMBDA`, `STYLE_CANDIDATE_POOL`, `STYLE_EMBED_BATCH_SIZE`, `STYLE_BACKFILL_LIMIT`
 - Approve service: `MIRROR_APPROVE_SECRET`, `MIRROR_APPROVE_HOST`, `MIRROR_APPROVE_PORT`, `MIRROR_RESUME_BACKFILL`, `MIRROR_LOG_LEVEL`, `MIRROR_DRAFT_PAYLOAD_FILE`
 - Bot approve UI: `MIRROR_BOT_TOKEN`, `TELEGRAM_BOT_TOKEN`, `OWNER_APPROVAL_CHAT_ID`
 - Pull/backfill tuning: `PULL_BATCH_SIZE`, `PULL_BATCH_SLEEP_SECONDS`, `PULL_CHAT_SLEEP_SECONDS`, `PULL_SINCE_HOURS`, `PULL_MAX_CHATS`, `PULL_ONE_CHAT`, `PULL_RECENT_LIMIT`, `PULL_USE_TAKEOUT`, `PULL_TAKEOUT_MAX_DELAY_SECONDS`, `BACKFILL_MAX_CHATS`, `BACKFILL_ONE_CHAT`
@@ -300,13 +366,15 @@ and all coordinate the single Telethon session):
 
 1. **Ingest** — Telethon user session (`pull` / `pull_recent` / `backfill`) →
    `messages`, cursor in `sync_state`. Paced, FloodWait-safe, resumable.
-2. **Embed** — `embed.py` → local 384-dim `all-MiniLM-L6-v2` vectors + `context_tag`
-   → `message_embeddings`.
-3. **Draft** — incoming → `eligibility` → `retrieve` (cosine KNN, `direction='out'`,
-   top-6) → `draft` (system+user prompt) → `codex exec` GPT-5.5 → draft (+ optional
-   Goal/Now/Next/Open).
-4. **Decide** — `approve_service` `/draft` + `/decide`; on approve/edit the draft is
-   sent **as the owner** via the Telethon session; every decision is written to
+2. **Embed** — `embed.py` → local 384-dim `all-MiniLM-L6-v2` TOPIC vectors +
+   `context_tag` → `message_embeddings`; `embed_style.py` → local 768-dim
+   StyleDistance STYLE vectors → `message_style_embeddings`.
+3. **Draft** — incoming → `eligibility` → `retrieve` (`direction='out'`; TOPIC+STYLE
+   +MMR blend, top-6) → `draft` (system+user prompt) → `codex exec` GPT-5.5 → draft
+   (+ optional Goal/Now/Next/Open).
+4. **Decide** — `approve_service` `/draft` + `/decide`; on approve/edit the final is
+   sent **as the owner** via the Telethon session, then added to the topic+style
+   corpus as a real sample (`add_owner_sample`); every decision is written to
    `feedback` — the signal that tightens future retrieval and style.
 
 ---

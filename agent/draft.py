@@ -155,10 +155,14 @@ async def draft_reply(
         tail = " ".join(m.text for m in request.thread[-3:] if m.text)
         query_text = f"{request.incoming_message}\n{tail}".strip()
 
+    # Topic anchor = incoming + thread tail (semantic subject). Style anchor = the
+    # raw incoming message on its own (its register), so exemplar selection mirrors
+    # how THIS message is written, not the concatenated tail.
     examples = await retrieve_examples(
         query_text=query_text,
         top_k=top_k,
         context_tag=request.context_tag,
+        style_query_text=request.incoming_message,
     )
 
     # Learning signal: recent cases where the owner edited a draft before sending.

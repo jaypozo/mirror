@@ -51,6 +51,35 @@ CREATE INDEX IF NOT EXISTS message_embeddings_context_tag_idx
 CREATE INDEX IF NOT EXISTS message_embeddings_embedded_at_idx
     ON message_embeddings (embedded_at);
 
+-- STYLE embeddings — a content-INDEPENDENT vector of HOW a message is written
+-- (length, register, punctuation, casing, formality), distinct from the TOPIC
+-- vector in `message_embeddings`. Produced by a local style-representation model
+-- (StyleDistance, 768-dim; see agent/style_embed.py). Retrieval blends topic
+-- similarity (message_embeddings) with style similarity (this table) so few-shot
+-- exemplars match the owner's VOICE, not just the subject.
+--
+-- CORE RULE: only the owner's REAL messages are embedded here — their sent
+-- history (direction='out') plus their APPROVED/EDITED FINAL replies (added at
+-- decide-time, see agent/corpus.py). A model DRAFT is NEVER embedded, so a
+-- machine guess can never be retrieved as if the owner wrote it.
+--
+-- Dimension 768 matches StyleDistance. Switching style models means changing 768
+-- to that model's dimension and re-embedding (the table must be empty to ALTER).
+CREATE TABLE IF NOT EXISTS message_style_embeddings (
+    chat_id bigint NOT NULL,
+    message_id bigint NOT NULL,
+    embedding vector(768) NOT NULL,
+    model text,
+    embedded_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (chat_id, message_id),
+    FOREIGN KEY (chat_id, message_id)
+        REFERENCES messages (chat_id, id)
+        ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS message_style_embeddings_embedded_at_idx
+    ON message_style_embeddings (embedded_at);
+
 CREATE TABLE IF NOT EXISTS feedback (
     id bigserial PRIMARY KEY,
     original_draft text NOT NULL,

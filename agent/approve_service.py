@@ -53,6 +53,7 @@ from telethon import TelegramClient
 # Load .env before the env-derived module constants below evaluate.
 load_dotenv()
 
+from agent.corpus import add_owner_sample
 from agent.draft import draft_reply
 from agent.edit_classify import classify_edit
 from agent.eligibility import EXCLUDED_TOPIC_CHAT_ID
@@ -166,20 +167,41 @@ async def _warm_up() -> None:
 
         vec = await embed_query("warmup")
         log.info(
-            "warm-up: embedding encoder loaded (dim=%d) in %.1fs",
+            "warm-up: topic encoder loaded (dim=%d) in %.1fs",
             len(vec) if vec else 0,
             time.monotonic() - start,
         )
     except Exception as exc:
         log.warning(
-            "warm-up: embedding encoder failed to preload in %.1fs (ignored — "
+            "warm-up: topic encoder failed to preload in %.1fs (ignored — "
             "the first /draft may be slow/cold): %s",
             time.monotonic() - start,
             exc,
         )
-    finally:
-        READY.set()
-        log.info("warm-up complete")
+
+    # Also preload the STYLE embedder (StyleDistance) so the first /draft's
+    # blended retrieval and the first /decide corpus-add are warm, not cold.
+    style_start = time.monotonic()
+    try:
+        from agent.style_embed import embed_style
+
+        svec, embedder = await embed_style(["warmup"])
+        log.info(
+            "warm-up: style embedder ready (%s, dim=%s) in %.1fs",
+            getattr(embedder, "name", None),
+            (len(svec[0]) if svec else None),
+            time.monotonic() - style_start,
+        )
+    except Exception as exc:
+        log.warning(
+            "warm-up: style embedder failed to preload in %.1fs (ignored — "
+            "retrieval falls back to topic-only): %s",
+            time.monotonic() - style_start,
+            exc,
+        )
+
+    READY.set()
+    log.info("warm-up complete")
 
 
 def _is_excluded_topic(chat_id: int, is_topic: bool) -> bool:
@@ -416,10 +438,23 @@ async def handle_decide(request: web.Request) -> web.Response:
             return web.json_response({"ok": False, "reason": "empty edit"})
 
         try:
-            await send_as_owner(pending.request, final)
+            sent_message = await send_as_owner(pending.request, final)
         except Exception as exc:
             log.exception("send-as-owner failed: %s", exc)
             return web.json_response({"ok": False, "reason": f"send failed: {exc}"}, status=500)
+
+        # CORE REQUIREMENT: the FINAL text the owner just sent (approved as-is, or
+        # their edit) is a genuine owner message — add it to the retrievable
+        # topic+style corpus immediately so it can be an exemplar right away. Only
+        # the sent final is ever indexed; the model's original_draft is NEVER a
+        # positive voice sample (it may only appear as the "before" of a
+        # contrastive edit-correction, handled separately in feedback). Fully
+        # guarded — the message is already sent, so indexing must never fail the
+        # request; normal ingest would pick it up regardless.
+        try:
+            await add_owner_sample(sent_message, final, pending.request)
+        except Exception as exc:
+            log.warning("add_owner_sample failed (ignored): %s", exc)
 
         # DUAL learning (Build 1): classify what the owner changed so the two
         # channels stay separate. Sending already succeeded above, so this is
@@ -479,7 +514,9 @@ async def handle_decide(request: web.Request) -> web.Response:
 # send_as_owner which reads that module's global STATE — keeps service.py
 # untouched. Behaviour is identical: send text as the owner, threaded to the agent's
 # original question message.
-async def send_as_owner(request: DraftRequest, text: str) -> None:
+async def send_as_owner(request: DraftRequest, text: str):
+    """Send `text` as the owner and return the sent Telethon Message (so the
+    caller can index the real message id into the corpus)."""
     assert STATE is not None
     if not request.target_chat_id:
         raise RuntimeError("no target_chat_id")
@@ -492,11 +529,11 @@ async def send_as_owner(request: DraftRequest, text: str) -> None:
     if request.target_chat_id > 0 and bot_username:
         peer = bot_username
     try:
-        await STATE.user.send_message(peer, text, reply_to=request.source_message_id)
+        return await STATE.user.send_message(peer, text, reply_to=request.source_message_id)
     except Exception:
         # reply_to ids differ between the bot API and the user session in a
         # private chat; if threading fails, still deliver the message inline.
-        await STATE.user.send_message(peer, text)
+        return await STATE.user.send_message(peer, text)
 
 
 # --------------------------------------------------------------------------- #

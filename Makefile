@@ -14,6 +14,9 @@ pull:
 embed:
 	$(PYTHON) -m ingest.embed
 
+embed-style:
+	$(PYTHON) -m ingest.embed_style
+
 bot:
 	$(PYTHON) -m agent.bot
 

@@ -67,11 +67,12 @@ Telegram (owner's USER account)
         ▼
 ingest ──► Postgres + pgvector  = the PRIMARY signal (owner's FULL history)
         │       │
-        │       ├── local sentence-transformers embeddings (384-dim, on-box)
+        │       ├── local sentence-transformers TOPIC embeddings (384-dim, on-box)
+        │       ├── local StyleDistance STYLE embeddings (768-dim, on-box)
         │       ▼
-        │   message_embeddings (pgvector)
+        │   message_embeddings + message_style_embeddings (pgvector)
         │       │
-incoming msg ───┤  retrieve top-K of the owner's own past replies (direction='out')
+incoming msg ───┤  retrieve top-K owner replies (direction='out') by TOPIC+STYLE+MMR blend
         │       ▼
         │   draft prompt  =  [living style sheet]
         │                  + [retrieved few-shot exemplars]
@@ -209,7 +210,7 @@ Ranked by fit for Mirror's stateless `codex exec` drafter:
 - **(C) Learn-from-edits few-shot corrections** — recent edits as explicit
   drafted-vs-sent corrections. **Shipped** (recency + magnitude weighted).
 - **(D) Style-embedding retrieval** — select exemplars by *style* similarity, not
-  topic similarity. **Next.** (See the key insight below.)
+  just topic similarity. **Shipped** (topic+style+MMR blend; see below).
 - **(E) Retrieve → rank → summarize → synthesize** — a multi-stage pipeline that
   summarizes retrieved context before drafting ([arXiv:2308.07968](https://arxiv.org/abs/2308.07968)).
   Partially present (optional thread summary); expand later.
@@ -225,17 +226,50 @@ Ranked by fit for Mirror's stateless `codex exec` drafter:
 **Recommendation implemented: A + B + C now; D next; bank G-ready pairs for
 later.**
 
-### Key insight: semantic ≠ stylistic similarity
+### Key insight: semantic ≠ stylistic similarity — style-based retrieval (D)
 
-The retrieval layer currently uses semantic embeddings (`all-MiniLM-L6-v2`),
-which retrieve **topic-similar** exemplars — good for relevance, but not
-guaranteed to be **style-similar**. Style similarity needs **content-independent**
-representations such as StyleDistance / LUAR
-([arXiv:2410.12757](https://arxiv.org/abs/2410.12757)). Technique (D) adds a
-style-embedding index so exemplar selection optimizes for *how* the owner wrote,
-independently of topic. The living style sheet (B) already compensates by
-injecting content-independent style features directly, but style-based retrieval
-is the principled next step.
+Topic embeddings (`all-MiniLM-L6-v2`) retrieve **topic-similar** exemplars — good
+for relevance, but not guaranteed to be **style-similar**. Style similarity needs
+**content-independent** representations such as StyleDistance / LUAR
+([arXiv:2410.12757](https://arxiv.org/abs/2410.12757)). Technique (D), now
+shipped, adds a second index so exemplar selection also optimizes for *how* the
+owner wrote, independently of topic:
+
+- **Style index** (`message_style_embeddings`, `agent/style_embed.py`) — a local
+  style-representation model (**StyleDistance**, 768-dim, on-box, no API key)
+  embeds every one of the owner's real sent messages into a content-independent
+  style space. One-time backfill: `python -m ingest.embed_style` (`make
+  embed-style`); new samples are style-embedded as they arrive. If the model
+  can't load offline, a normalized **stylometric feature vector** (the exact
+  features the style sheet profiles) is used on the fly instead — style retrieval
+  never hard-fails.
+- **Blended selection** (`agent/retrieve.py`) — over-fetch the topic-nearest pool,
+  then re-rank by `STYLE_BLEND_TOPIC_WEIGHT · topic_sim + STYLE_BLEND_STYLE_WEIGHT
+  · style_sim`, where `style_sim` is the candidate's style-cosine to the incoming
+  message (so the owner's replies are chosen to **mirror the incoming register** —
+  terse for terse, formal for formal). A final **MMR** pass
+  (`STYLE_MMR_LAMBDA`) over the style vectors drops near-duplicate exemplars so the
+  few-shot set spans different lengths/registers. All weights are env-tunable.
+- **Guarded** — any style failure degrades to the original topic-only
+  nearest-neighbour order, so drafting is never blocked.
+
+### Real samples only: drafts never enter the corpus (hard rule)
+
+The exemplar corpus — both the topic index and the new style index — contains
+**only the owner's REAL messages**: their ingested sent history (`direction='out'`)
+plus their **approved/edited FINAL replies**. A model **draft is never embedded or
+retrievable as if the owner wrote it.**
+
+- An approved or edited final is the text the owner actually sent, so it is a
+  genuine owner sample. It is added to the retrievable topic+style corpus
+  **at decide-time** (`agent/corpus.py::add_owner_sample`), keyed by the real
+  Telegram message id, so it can be an exemplar immediately (and normal ingest
+  re-pulling it is an idempotent no-op).
+- `feedback.original_draft` (the model's guess) is **never** a positive voice
+  sample. It appears only as the "before" side of a contrastive edit-correction
+  (`fetch_recent_edits`, `agent/style_sheet.py`), never as an exemplar to imitate.
+  Nothing in the ingest/embedding path ever writes a draft into `messages` or
+  either embedding table.
 
 ## Eval / scoreboard
 
@@ -261,8 +295,9 @@ corpus.
    the voice channel and intent to per-thread decision notes. **Shipped.**
 4. **Thread-aware goal state** — segment interleaved threads; per-thread
    goal/current_task/stage feeds the summary + draft. **Shipped.**
-5. **Style-based retrieval (D)** — add a style-embedding index; select exemplars
-   by style, not topic.
+5. **Style-based retrieval (D)** — style-embedding index (StyleDistance) + a
+   topic+style+MMR blended selection; exemplars chosen by voice, not just topic.
+   **Shipped.**
 6. **Scoreboard** — persist the four eval metrics and surface a trend.
 7. **Preference-pair banking (G-ready)** — the `feedback` schema already captures
    chosen/rejected pairs; formalize export for a future DPO/ORPO run once an
