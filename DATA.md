@@ -296,10 +296,15 @@ request must carry header `X-Mirror-Secret` == `MIRROR_APPROVE_SECRET` (fail
 closed). Pending drafts live in memory keyed by a 12-hex `approval_id`, TTL 1h.
 
 Endpoints:
+- **POST `/draft_gate`** — `{chat_id, question_msg_id, question, is_topic}` →
+  returns `{ok:true, needs_reply:true, gate}` only for `NEEDS_REPLY`; returns
+  `204 No Content` for SKIP/precheck/classifier-failure paths. Fleet bots must
+  call this before rendering any placeholder.
 - **POST `/draft`** — `{chat_id, question_msg_id, question, thread[], is_topic,
   bot_username?}` → drafts, stores a pending, returns `{ok, approval_id, draft,
   summary}`. Needs-reply `SKIP` verdicts, excluded topic threads, and empty
-  questions return `204 No Content` and must render nothing.
+  questions return `204 No Content`; callers must delete any already-rendered
+  placeholder and render nothing.
 - **POST `/decide`** — `{approval_id, action: approve|edit|dismiss, edited_text?}`.
   `approve` sends `draft` as the owner; `edit` sends `edited_text`; `dismiss`
   sends nothing. All three write a `feedback` row. On `edit`, after the send

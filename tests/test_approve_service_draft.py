@@ -63,6 +63,87 @@ async def test_handle_draft_skip_returns_no_content_and_does_not_draft(
 
 
 @pytest.mark.asyncio
+async def test_handle_draft_classifier_exception_skips_and_does_not_draft(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def classify(_text: str) -> NeedsReplyDecision:
+        raise RuntimeError("classifier exploded")
+
+    async def draft(*_args, **_kwargs):
+        raise AssertionError("draft_reply must not run when classifier fails")
+
+    monkeypatch.setattr(approve_service, "classify_needs_reply", classify)
+    monkeypatch.setattr(approve_service, "draft_reply", draft)
+
+    response = await approve_service.handle_draft(FakeRequest(draft_payload("Night, Jay.")))
+
+    assert response.status == 204
+    assert response.body in (None, b"")
+    assert approve_service.STATE is not None
+    assert approve_service.STATE.pending == {}
+
+
+@pytest.mark.asyncio
+async def test_handle_draft_gate_skip_returns_no_content(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def classify(_text: str) -> NeedsReplyDecision:
+        return NeedsReplyDecision(SKIP, "classifier", "statement")
+
+    monkeypatch.setattr(approve_service, "classify_needs_reply", classify)
+
+    response = await approve_service.handle_draft_gate(
+        FakeRequest(draft_payload("👍 Night, Jay."))
+    )
+
+    assert response.status == 204
+    assert response.body in (None, b"")
+
+
+@pytest.mark.asyncio
+async def test_handle_draft_gate_classifier_exception_skips(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def classify(_text: str) -> NeedsReplyDecision:
+        raise RuntimeError("classifier exploded")
+
+    monkeypatch.setattr(approve_service, "classify_needs_reply", classify)
+
+    response = await approve_service.handle_draft_gate(
+        FakeRequest(draft_payload("Taking a look tonight."))
+    )
+
+    assert response.status == 204
+    assert response.body in (None, b"")
+
+
+@pytest.mark.asyncio
+async def test_handle_draft_gate_needs_reply_returns_gate_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def classify(_text: str) -> NeedsReplyDecision:
+        return NeedsReplyDecision(NEEDS_REPLY, "heuristic", "question mark")
+
+    monkeypatch.setattr(approve_service, "classify_needs_reply", classify)
+
+    response = await approve_service.handle_draft_gate(
+        FakeRequest(draft_payload("Can you review?"))
+    )
+    body = json.loads(response.text)
+
+    assert response.status == 200
+    assert body == {
+        "ok": True,
+        "needs_reply": True,
+        "gate": {
+            "verdict": NEEDS_REPLY,
+            "stage": "heuristic",
+            "reason": "question mark",
+        },
+    }
+
+
+@pytest.mark.asyncio
 async def test_handle_draft_needs_reply_draft_failure_returns_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

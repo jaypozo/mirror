@@ -202,6 +202,38 @@ Content-Type: application/json
 
 A missing/incorrect header returns `401 {"ok": false, "reason": "unauthorized"}`.
 
+### POST `/draft_gate`
+
+Call this before rendering any loading placeholder or card:
+
+```json
+{
+  "chat_id": 123456789,
+  "question_msg_id": 42,
+  "question": "Can you review this before I ship it?",
+  "is_topic": false
+}
+```
+
+Needs-reply response:
+
+```json
+{
+  "ok": true,
+  "needs_reply": true,
+  "gate": {"verdict": "NEEDS_REPLY", "stage": "heuristic", "reason": "question mark"}
+}
+```
+
+Silent skip response:
+
+```http
+204 No Content
+```
+
+On `204`, render nothing: no placeholder, no card, no warning. Classifier
+errors/timeouts/uncertainty are SKIP and also return `204`.
+
 ### POST `/draft`
 
 Request:
@@ -236,13 +268,15 @@ Silent skip response:
 204 No Content
 ```
 
-The service returns `204` when the needs-reply gate decides no reply is needed
-or when a precheck rules the message out (`no question text`, excluded topic).
-Treat this as a log-only no-op: render no card, no warning, and no fallback.
-Failure returns `{"ok": false, "reason": "..."}` only for real draft/service
-failures, including `503` while the service is still warming up. Render a
-**loading placeholder** while `/draft` is in flight; the call includes a `codex
-exec` round-trip (~13s).
+The service repeats the needs-reply gate as a belt-and-braces guard. It returns
+`204` when the gate decides no reply is needed or when a precheck rules the
+message out (`no question text`, excluded topic). Treat this as a log-only no-op:
+delete any already-rendered placeholder and render no card, warning, or fallback.
+Failure returns `{"ok": false, "reason": "..."}` only for messages already
+classified `NEEDS_REPLY` whose draft/service path genuinely failed, including
+`503` while the service is still warming up. Render a **loading placeholder** only
+after `/draft_gate` returns `NEEDS_REPLY`; `/draft` includes a `codex exec`
+round-trip (~13s).
 
 ### POST `/decide`
 
