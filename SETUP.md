@@ -219,7 +219,7 @@ Request:
 }
 ```
 
-Response:
+Draft response:
 
 ```json
 {
@@ -230,10 +230,19 @@ Response:
 }
 ```
 
-Failure/refusal returns `{"ok": false, "reason": "..."}` — e.g. `no question
-text`, `topic thread excluded`, or `503` while the service is still warming up.
-Render a **loading placeholder** while `/draft` is in flight; the call includes a
-`codex exec` round-trip (~13s).
+Silent skip response:
+
+```http
+204 No Content
+```
+
+The service returns `204` when the needs-reply gate decides no reply is needed
+or when a precheck rules the message out (`no question text`, excluded topic).
+Treat this as a log-only no-op: render no card, no warning, and no fallback.
+Failure returns `{"ok": false, "reason": "..."}` only for real draft/service
+failures, including `503` while the service is still warming up. Render a
+**loading placeholder** while `/draft` is in flight; the call includes a `codex
+exec` round-trip (~13s).
 
 ### POST `/decide`
 

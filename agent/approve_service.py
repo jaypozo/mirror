@@ -312,7 +312,8 @@ def _load_pending() -> None:
 #     is_topic: bool           # true if inside a the excluded group topic thread
 #   }
 #   -> { ok, approval_id, draft, summary: {goal, now, next, open[]} }
-#      or { ok:false, reason }
+#      or 204 No Content when the needs-reply gate decides no reply is needed
+#      or { ok:false, reason } for real draft/service failures
 # --------------------------------------------------------------------------- #
 async def handle_draft(request: web.Request) -> web.Response:
     if not _authorized(request):
@@ -343,7 +344,7 @@ async def handle_draft(request: web.Request) -> web.Response:
             stage="precheck",
             reason="topic thread excluded",
         )
-        return web.json_response({"ok": False, "reason": "topic thread excluded"})
+        return web.Response(status=204)
     if not question:
         _log_needs_reply_gate(
             message_id=question_msg_id,
@@ -351,7 +352,7 @@ async def handle_draft(request: web.Request) -> web.Response:
             stage="precheck",
             reason="no question text",
         )
-        return web.json_response({"ok": False, "reason": "no question text"})
+        return web.Response(status=204)
 
     gate = await classify_needs_reply(question)
     _log_needs_reply_gate(
@@ -361,17 +362,7 @@ async def handle_draft(request: web.Request) -> web.Response:
         reason=gate.reason,
     )
     if not gate.needs_reply:
-        return web.json_response(
-            {
-                "ok": False,
-                "reason": f"needs-reply gate skipped: {gate.reason}",
-                "gate": {
-                    "verdict": gate.verdict,
-                    "stage": gate.stage,
-                    "reason": gate.reason,
-                },
-            }
-        )
+        return web.Response(status=204)
 
     thread = _thread_from_payload(body.get("thread", []))
 
