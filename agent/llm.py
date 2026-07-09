@@ -14,6 +14,13 @@ from dotenv import load_dotenv
 Message = dict[str, str]
 
 
+def _int_env(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)) or str(default))
+    except (TypeError, ValueError):
+        return default
+
+
 class LLMClient(ABC):
     name: str
     model: str
@@ -150,17 +157,26 @@ class DryRunLLMClient(LLMClient):
         return "Got it. I will take a look and follow up with the next step."
 
 
-def build_llm_client() -> LLMClient:
+def build_llm_client(
+    *,
+    model: str | None = None,
+    reasoning_effort: str | None = None,
+    timeout_seconds: int | None = None,
+) -> LLMClient:
     load_dotenv()
     provider = os.getenv("LLM_PROVIDER", "codex").lower().strip()
 
     if provider == "codex":
         return CodexLLMClient(
-            model=os.getenv("LLM_MODEL", "gpt-5.5"),
-            reasoning_effort=os.getenv("CODEX_REASONING_EFFORT", "high"),
+            model=model or os.getenv("LLM_MODEL", "gpt-5.5"),
+            reasoning_effort=reasoning_effort
+            or os.getenv("CODEX_REASONING_EFFORT", "high"),
+            timeout_seconds=timeout_seconds
+            if timeout_seconds is not None
+            else _int_env("CODEX_TIMEOUT_SECONDS", 300),
         )
 
-    model = os.getenv("LLM_MODEL", "gpt-4.1-mini")
+    model = model or os.getenv("LLM_MODEL", "gpt-4.1-mini")
     api_key = os.getenv("LLM_API_KEY") or os.getenv("OPENAI_API_KEY")
 
     if provider == "openai" and api_key:

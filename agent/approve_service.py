@@ -58,6 +58,7 @@ from agent.draft import draft_reply
 from agent.edit_classify import classify_edit
 from agent.eligibility import EXCLUDED_TOPIC_CHAT_ID
 from agent.feedback import record_feedback
+from agent.needs_reply import classify_needs_reply
 from agent.scoreboard import compute_scoreboard, validate_init_data
 from agent.threads import record_intent_note
 from agent.service import maybe_resume_backfill  # reuse the drip resumer as-is
@@ -216,6 +217,22 @@ def _is_excluded_topic(chat_id: int, is_topic: bool) -> bool:
     return chat_id == EXCLUDED_TOPIC_CHAT_ID and bool(is_topic)
 
 
+def _log_needs_reply_gate(
+    *,
+    message_id: int | str | None,
+    verdict: str,
+    stage: str,
+    reason: str,
+) -> None:
+    log.warning(
+        "NEEDS_REPLY_GATE message_id=%s verdict=%s stage=%s reason=%s",
+        message_id if message_id is not None else "unknown",
+        verdict,
+        stage,
+        reason.replace("\n", " ")[:240],
+    )
+
+
 def _thread_from_payload(items: list[dict]) -> list[ChatMessage]:
     thread: list[ChatMessage] = []
     for it in items or []:
@@ -320,9 +337,41 @@ async def handle_draft(request: web.Request) -> web.Response:
     is_topic = bool(body.get("is_topic", False))
 
     if _is_excluded_topic(chat_id, is_topic):
+        _log_needs_reply_gate(
+            message_id=question_msg_id,
+            verdict="SKIP",
+            stage="precheck",
+            reason="topic thread excluded",
+        )
         return web.json_response({"ok": False, "reason": "topic thread excluded"})
     if not question:
+        _log_needs_reply_gate(
+            message_id=question_msg_id,
+            verdict="SKIP",
+            stage="precheck",
+            reason="no question text",
+        )
         return web.json_response({"ok": False, "reason": "no question text"})
+
+    gate = await classify_needs_reply(question)
+    _log_needs_reply_gate(
+        message_id=question_msg_id,
+        verdict=gate.verdict,
+        stage=gate.stage,
+        reason=gate.reason,
+    )
+    if not gate.needs_reply:
+        return web.json_response(
+            {
+                "ok": False,
+                "reason": f"needs-reply gate skipped: {gate.reason}",
+                "gate": {
+                    "verdict": gate.verdict,
+                    "stage": gate.stage,
+                    "reason": gate.reason,
+                },
+            }
+        )
 
     thread = _thread_from_payload(body.get("thread", []))
 

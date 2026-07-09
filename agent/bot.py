@@ -64,6 +64,27 @@ def approval_keyboard(approval_id: str) -> InlineKeyboardMarkup:
     )
 
 
+def editing_text(result: DraftResult) -> str:
+    return f"{approval_text(result)}\n\nEditing - send your version."
+
+
+def editing_keyboard(approval_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("Cancel Edit", callback_data=f"cancel_edit:{approval_id}")]]
+    )
+
+
+def enter_edit_state(chat_id: int, approval_id: str) -> None:
+    PENDING_EDITS[chat_id] = approval_id
+
+
+def cancel_edit_state(chat_id: int, approval_id: str) -> bool:
+    if PENDING_EDITS.get(chat_id) != approval_id:
+        return False
+    PENDING_EDITS.pop(chat_id, None)
+    return True
+
+
 async def send_to_target(bot: Any, request: DraftRequest, text: str) -> None:
     if not request.target_chat_id:
         raise RuntimeError("No target_chat_id was provided by the message-source integration.")
@@ -142,6 +163,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 metadata=pending.request.metadata,
             )
             PENDING_APPROVALS.pop(approval_id, None)
+            if query.message:
+                PENDING_EDITS.pop(query.message.chat_id, None)
             await query.edit_message_text(f"Approved and sent.\n\n{pending.result.draft}")
         except Exception as exc:
             await query.edit_message_text(f"Approve failed: {exc}")
@@ -149,13 +172,31 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     if action == "edit":
         if query.message:
-            PENDING_EDITS[query.message.chat_id] = approval_id
+            enter_edit_state(query.message.chat_id, approval_id)
         await query.edit_message_text(
-            f"{approval_text(pending.result)}\n\nSend the edited final text as your next message."
+            editing_text(pending.result),
+            reply_markup=editing_keyboard(approval_id),
         )
         return
 
+    if action == "cancel_edit":
+        if query.message and cancel_edit_state(query.message.chat_id, approval_id):
+            await query.edit_message_text(
+                approval_text(pending.result),
+                reply_markup=approval_keyboard(approval_id),
+            )
+        elif query.message:
+            await query.edit_message_text(
+                approval_text(pending.result),
+                reply_markup=approval_keyboard(approval_id),
+            )
+        else:
+            await query.answer("Edit cancelled.")
+        return
+
     if action == "dismiss":
+        if query.message:
+            PENDING_EDITS.pop(query.message.chat_id, None)
         await record_feedback(
             original_draft=pending.result.draft,
             final_text=None,
@@ -202,6 +243,16 @@ async def handle_edit_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         metadata=pending.request.metadata,
     )
     PENDING_APPROVALS.pop(approval_id, None)
+    if pending.approval_message_id is not None:
+        try:
+            await context.bot.edit_message_text(
+                chat_id=pending.approval_chat_id,
+                message_id=pending.approval_message_id,
+                text=f"{sent_note}\n\n{final_text}",
+            )
+            return
+        except Exception:
+            pass
     await update.message.reply_text(sent_note)
 
 
