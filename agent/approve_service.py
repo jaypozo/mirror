@@ -58,7 +58,7 @@ from agent.draft import draft_reply
 from agent.edit_classify import classify_edit
 from agent.eligibility import EXCLUDED_TOPIC_CHAT_ID
 from agent.feedback import record_feedback
-from agent.needs_reply import classify_needs_reply
+from agent.needs_reply import SKIP, NeedsReplyDecision, classify_needs_reply
 from agent.scoreboard import compute_scoreboard, validate_init_data
 from agent.threads import record_intent_note
 from agent.service import maybe_resume_backfill  # reuse the drip resumer as-is
@@ -233,6 +233,14 @@ def _log_needs_reply_gate(
     )
 
 
+async def _classify_needs_reply_gate(text: str) -> NeedsReplyDecision:
+    try:
+        return await classify_needs_reply(text)
+    except Exception as exc:
+        log.exception("needs-reply gate failed; skipping draft: %s", exc)
+        return NeedsReplyDecision(SKIP, "classifier", f"classifier exception: {exc}")
+
+
 def _thread_from_payload(items: list[dict]) -> list[ChatMessage]:
     thread: list[ChatMessage] = []
     for it in items or []:
@@ -303,6 +311,82 @@ def _load_pending() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# POST /draft_gate
+#   body: {
+#     chat_id: int,
+#     question_msg_id: int,
+#     question: str,
+#     is_topic: bool
+#   }
+#   -> 200 { ok:true, needs_reply:true, gate:{...} }
+#      or 204 No Content when no reply should be drafted/rendered
+#      or { ok:false, reason } for auth/readiness/bad-json failures
+#
+# The fleet bot calls this BEFORE rendering a placeholder. /draft repeats the
+# same gate as a belt-and-braces guard, so bypassing this endpoint cannot make a
+# SKIP message draft or render.
+# --------------------------------------------------------------------------- #
+async def handle_draft_gate(request: web.Request) -> web.Response:
+    if not _authorized(request):
+        return web.json_response({"ok": False, "reason": "unauthorized"}, status=401)
+    if not await _wait_until_ready():
+        log.warning("handle_draft_gate: still warming up after %.0fs, refusing", WARMUP_WAIT_TIMEOUT_SECONDS)
+        return web.json_response(
+            {"ok": False, "reason": "service still warming up, try again shortly"},
+            status=503,
+        )
+
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"ok": False, "reason": "bad json"}, status=400)
+
+    chat_id = int(body.get("chat_id"))
+    question_msg_id = body.get("question_msg_id")
+    question = str(body.get("question") or "").strip()
+    is_topic = bool(body.get("is_topic", False))
+
+    if _is_excluded_topic(chat_id, is_topic):
+        _log_needs_reply_gate(
+            message_id=question_msg_id,
+            verdict="SKIP",
+            stage="precheck",
+            reason="topic thread excluded",
+        )
+        return web.Response(status=204)
+    if not question:
+        _log_needs_reply_gate(
+            message_id=question_msg_id,
+            verdict="SKIP",
+            stage="precheck",
+            reason="no question text",
+        )
+        return web.Response(status=204)
+
+    gate = await _classify_needs_reply_gate(question)
+    _log_needs_reply_gate(
+        message_id=question_msg_id,
+        verdict=gate.verdict,
+        stage=gate.stage,
+        reason=gate.reason,
+    )
+    if not gate.needs_reply:
+        return web.Response(status=204)
+
+    return web.json_response(
+        {
+            "ok": True,
+            "needs_reply": True,
+            "gate": {
+                "verdict": gate.verdict,
+                "stage": gate.stage,
+                "reason": gate.reason,
+            },
+        }
+    )
+
+
+# --------------------------------------------------------------------------- #
 # POST /draft
 #   body: {
 #     chat_id: int,            # the chat the agent messaged the owner in
@@ -354,7 +438,7 @@ async def handle_draft(request: web.Request) -> web.Response:
         )
         return web.Response(status=204)
 
-    gate = await classify_needs_reply(question)
+    gate = await _classify_needs_reply_gate(question)
     _log_needs_reply_gate(
         message_id=question_msg_id,
         verdict=gate.verdict,
@@ -684,6 +768,7 @@ async def build_and_run() -> None:
     app.add_routes(
         [
             web.post("/draft", handle_draft),
+            web.post("/draft_gate", handle_draft_gate),
             web.post("/decide", handle_decide),
             web.get("/health", handle_health),
             web.get("/scoreboard", handle_scoreboard),
