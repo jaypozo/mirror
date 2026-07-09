@@ -298,7 +298,8 @@ closed). Pending drafts live in memory keyed by a 12-hex `approval_id`, TTL 1h.
 Endpoints:
 - **POST `/draft`** — `{chat_id, question_msg_id, question, thread[], is_topic,
   bot_username?}` → drafts, stores a pending, returns `{ok, approval_id, draft,
-  summary}`. Refuses the excluded group topic threads and empty questions.
+  summary}`. Needs-reply `SKIP` verdicts, excluded topic threads, and empty
+  questions return `204 No Content` and must render nothing.
 - **POST `/decide`** — `{approval_id, action: approve|edit|dismiss, edited_text?}`.
   `approve` sends `draft` as the owner; `edit` sends `edited_text`; `dismiss`
   sends nothing. All three write a `feedback` row. On `edit`, after the send
