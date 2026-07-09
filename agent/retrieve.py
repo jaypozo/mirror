@@ -136,6 +136,15 @@ def _float_env(name: str, default: float) -> float:
         return default
 
 
+def _vector_to_list(value) -> list[float] | None:
+    if value is None:
+        return None
+    to_list = getattr(value, "to_list", None)
+    if callable(to_list):
+        return [float(item) for item in to_list()]
+    return [float(item) for item in value]
+
+
 def _int_env(name: str, default: int) -> int:
     try:
         return int(os.getenv(name, str(default)))
@@ -253,7 +262,7 @@ async def retrieve_examples(
                 chat_title=r["chat_title"],
                 text=r["text"],
                 distance=float(r["distance"]),
-                style_vec=(list(r["style_embedding"]) if r["style_embedding"] is not None else None),
+                style_vec=_vector_to_list(r["style_embedding"]),
             )
             for r in rows
         ]
