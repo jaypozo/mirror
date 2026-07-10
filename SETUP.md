@@ -272,11 +272,11 @@ The service repeats the needs-reply gate as a belt-and-braces guard. It returns
 `204` when the gate decides no reply is needed or when a precheck rules the
 message out (`no question text`, excluded topic). Treat this as a log-only no-op:
 delete any already-rendered placeholder and render no card, warning, or fallback.
-Failure returns `{"ok": false, "reason": "..."}` only for messages already
-classified `NEEDS_REPLY` whose draft/service path genuinely failed, including
-`503` while the service is still warming up. Render a **loading placeholder** only
-after `/draft_gate` returns `NEEDS_REPLY`; `/draft` includes a `codex exec`
-round-trip (~13s).
+Draft LLM failures, timeouts, and empty/unusable output also return `204`; they
+are logged server-side only. `503` is still reserved for readiness/warm-up
+failure before drafting starts. Render a **loading placeholder** only after
+`/draft_gate` returns `NEEDS_REPLY`; `/draft` includes a `codex exec` round-trip
+with a 60s service-side timeout.
 
 ### POST `/decide`
 

@@ -303,8 +303,9 @@ Endpoints:
 - **POST `/draft`** — `{chat_id, question_msg_id, question, thread[], is_topic,
   bot_username?}` → drafts, stores a pending, returns `{ok, approval_id, draft,
   summary}`. Needs-reply `SKIP` verdicts, excluded topic threads, and empty
-  questions return `204 No Content`; callers must delete any already-rendered
-  placeholder and render nothing.
+  questions return `204 No Content`. Draft LLM failures/timeouts and unusable
+  draft output also return `204 No Content`; callers must delete any
+  already-rendered placeholder and render nothing.
 - **POST `/decide`** — `{approval_id, action: approve|edit|dismiss, edited_text?}`.
   `approve` sends `draft` as the owner; `edit` sends `edited_text`; `dismiss`
   sends nothing. All three write a `feedback` row. On `edit`, after the send

@@ -135,12 +135,6 @@ def format_thread_context(context: ThreadContext | None) -> str:
     return "\n".join(lines) + "\n"
 
 
-def heuristic_draft(request: DraftRequest) -> str:
-    if "?" in request.incoming_message:
-        return "Let me check one detail and get back to you."
-    return "Got it, on it."
-
-
 async def draft_reply(
     request: DraftRequest,
     summary: Brief | None = None,
@@ -219,10 +213,14 @@ Reply as the owner. Output only the reply text."""
             ]
         )
     except Exception as exc:
-        print(f"[draft] LLM draft failed; using heuristic fallback: {exc}", file=sys.stderr)
-        response = heuristic_draft(request)
+        print(f"[draft] LLM draft failed: {exc}", file=sys.stderr)
+        raise
 
-    draft = response.strip() or heuristic_draft(request)
+    draft = response.strip()
+    if not draft:
+        print("[draft] LLM draft returned empty output", file=sys.stderr)
+        raise RuntimeError("LLM returned empty draft")
+
     return DraftResult(
         draft=draft,
         summary=resolved_summary or Brief.empty(),
