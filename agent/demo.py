@@ -125,7 +125,7 @@ async def run() -> None:
         result = await draft_reply(request)
     except Exception as exc:
         print(f"[demo] draft failed: {exc}", file=sys.stderr)
-        return
+        raise SystemExit(1) from None
 
     print("=" * 70)
     print("RETRIEVED EXAMPLES OF THE OWNER'S VOICE (top-K):")
