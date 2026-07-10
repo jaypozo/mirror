@@ -240,13 +240,17 @@ it survives only as the "before" of a contrastive edit-correction
    facts; don't copy examples verbatim") + a **user** prompt (the formatted
    retrieved examples, an optional thread transcript, then "Now draft the reply to
    this incoming message: …").
-5. One LLM call; on any error, a tiny heuristic fallback.
+5. One LLM call; draft LLM errors, timeouts, and empty output raise to the
+   caller. The inline approve service logs those failures and returns
+   `204 No Content`, so the fleet bot deletes any placeholder and renders
+   nothing.
 
 **LLM backends (`agent/llm.py`)**, selected by `LLM_PROVIDER`:
 - **`codex`** (default) — shells out to `codex exec --skip-git-repo-check -s
   read-only -m <LLM_MODEL=gpt-5.5> -c model_reasoning_effort=<CODEX_REASONING_EFFORT=high>`,
-  reads the final message from a temp file, 300s timeout. Auth via ChatGPT OAuth
-  → **no OpenAI API key**. Fresh/stateless per draft (~13s typical).
+  reads the final message from a temp file, 300s client default timeout. The
+  inline approve `/draft` path overrides this to 60s. Auth via ChatGPT OAuth →
+  **no OpenAI API key**. Fresh/stateless per draft (~13s typical).
 - **`openai`** — needs `LLM_API_KEY` / `OPENAI_API_KEY`.
 - **`dry-run`** — canned responses.
 

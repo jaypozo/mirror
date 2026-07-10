@@ -205,20 +205,15 @@ Now draft the owner's reply to this incoming message:
 Reply as the owner. Output only the reply text."""
 
     client = llm or build_llm_client()
-    try:
-        response = await client.complete(
-            [
-                {"role": "system", "content": DRAFT_SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ]
-        )
-    except Exception as exc:
-        print(f"[draft] LLM draft failed: {exc}", file=sys.stderr)
-        raise
+    response = await client.complete(
+        [
+            {"role": "system", "content": DRAFT_SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ]
+    )
 
     draft = response.strip()
     if not draft:
-        print("[draft] LLM draft returned empty output", file=sys.stderr)
         raise RuntimeError("LLM returned empty draft")
 
     return DraftResult(
@@ -232,7 +227,11 @@ Reply as the owner. Output only the reply text."""
 async def main() -> None:
     payload = json.load(sys.stdin)
     request = DraftRequest.from_dict(payload)
-    result = await draft_reply(request)
+    try:
+        result = await draft_reply(request)
+    except Exception as exc:
+        print(f"[draft] draft failed: {exc}", file=sys.stderr)
+        raise SystemExit(1) from None
     print(
         json.dumps(
             {

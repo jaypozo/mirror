@@ -480,6 +480,8 @@ async def handle_draft(request: web.Request) -> web.Response:
         log.exception("draft failed; returning no content: %s", exc)
         return web.Response(status=204)
 
+    # Belt-and-braces: draft_reply raises on empty output today, but keep this
+    # endpoint contract silent even if a future drafter returns an unusable value.
     if not (result.draft or "").strip():
         log.error("draft failed; LLM returned empty/unusable output")
         return web.Response(status=204)

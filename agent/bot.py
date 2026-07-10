@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import uuid
 from dataclasses import dataclass
@@ -22,6 +23,8 @@ from telegram.ext import (
 from agent.draft import draft_reply
 from agent.feedback import record_feedback
 from agent.types import DraftRequest, DraftResult
+
+log = logging.getLogger("mirror.bot")
 
 
 @dataclass
@@ -98,8 +101,13 @@ async def post_approval_request(
     application: Application,
     request: DraftRequest,
     approval_chat_id: int,
-) -> str:
-    result = await draft_reply(request)
+) -> str | None:
+    try:
+        result = await draft_reply(request)
+    except Exception as exc:
+        log.exception("draft failed: %s", exc)
+        return None
+
     approval_id = uuid.uuid4().hex
     message = await application.bot.send_message(
         chat_id=approval_chat_id,
@@ -133,6 +141,8 @@ async def draft_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     approval_id = await post_approval_request(context.application, request, update.effective_chat.id)
+    if approval_id is None:
+        return
     await update.message.reply_text(f"Draft queued: {approval_id}")
 
 
@@ -260,13 +270,17 @@ async def post_payload_file_if_configured(application: Application, approval_cha
     payload_file = os.getenv("MIRROR_DRAFT_PAYLOAD_FILE")
     if not payload_file:
         return
-    with open(payload_file, encoding="utf-8") as handle:
-        payload = json.load(handle)
-    approval_id = await post_approval_request(
-        application,
-        DraftRequest.from_dict(payload),
-        approval_chat_id,
-    )
+    try:
+        with open(payload_file, encoding="utf-8") as handle:
+            payload = json.load(handle)
+        request = DraftRequest.from_dict(payload)
+    except Exception as exc:
+        log.exception("could not load draft payload file %s: %s", payload_file, exc)
+        return
+
+    approval_id = await post_approval_request(application, request, approval_chat_id)
+    if approval_id is None:
+        return
     print(f"[bot] posted approval request from {payload_file}: {approval_id}")
 
 
