@@ -121,7 +121,11 @@ async def run() -> None:
     )
 
     print("Retrieving the owner's similar past replies + drafting via GPT-5.5 (codex exec)...\n")
-    result = await draft_reply(request)
+    try:
+        result = await draft_reply(request)
+    except Exception as exc:
+        print(f"[demo] draft failed: {exc}", file=sys.stderr)
+        raise SystemExit(1) from None
 
     print("=" * 70)
     print("RETRIEVED EXAMPLES OF THE OWNER'S VOICE (top-K):")

@@ -7,6 +7,7 @@ import pytest
 
 from agent import approve_service
 from agent.needs_reply import NEEDS_REPLY, SKIP, NeedsReplyDecision
+from agent.types import Brief, DraftResult
 
 
 class FakeTransport:
@@ -144,7 +145,91 @@ async def test_handle_draft_gate_needs_reply_returns_gate_payload(
 
 
 @pytest.mark.asyncio
-async def test_handle_draft_needs_reply_draft_failure_returns_error(
+async def test_handle_draft_success_unchanged_and_uses_60s_llm_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def classify(_text: str) -> NeedsReplyDecision:
+        return NeedsReplyDecision(NEEDS_REPLY, "heuristic", "question mark")
+
+    captured: dict[str, object] = {}
+
+    def build_llm_client(*, timeout_seconds: int | None = None):
+        captured["timeout_seconds"] = timeout_seconds
+        return SimpleNamespace(timeout_seconds=timeout_seconds)
+
+    async def draft(request, *, include_summary=False, llm=None, **_kwargs):
+        captured["request"] = request
+        captured["include_summary"] = include_summary
+        captured["llm_timeout"] = getattr(llm, "timeout_seconds", None)
+        return DraftResult(draft="Send it over.", summary=Brief.empty())
+
+    monkeypatch.setattr(approve_service, "classify_needs_reply", classify)
+    monkeypatch.setattr(approve_service, "build_llm_client", build_llm_client)
+    monkeypatch.setattr(approve_service, "draft_reply", draft)
+
+    response = await approve_service.handle_draft(FakeRequest(draft_payload("Can you review?")))
+    body = json.loads(response.text)
+
+    assert response.status == 200
+    assert body["ok"] is True
+    assert body["approval_id"]
+    assert body["draft"] == "Send it over."
+    assert body["summary"] == Brief.empty().to_dict()
+    assert captured["timeout_seconds"] == 60
+    assert captured["llm_timeout"] == 60
+    assert captured["include_summary"] is True
+    assert approve_service.STATE is not None
+    assert set(approve_service.STATE.pending) == {body["approval_id"]}
+
+
+@pytest.mark.asyncio
+async def test_handle_draft_timeout_returns_no_content_and_no_pending_side_effects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def classify(_text: str) -> NeedsReplyDecision:
+        return NeedsReplyDecision(NEEDS_REPLY, "heuristic", "question mark")
+
+    def build_llm_client(*, timeout_seconds: int | None = None):
+        return SimpleNamespace(timeout_seconds=timeout_seconds)
+
+    async def draft(*_args, llm=None, **_kwargs):
+        raise RuntimeError(f"codex exec timed out after {llm.timeout_seconds}s")
+
+    monkeypatch.setattr(approve_service, "classify_needs_reply", classify)
+    monkeypatch.setattr(approve_service, "build_llm_client", build_llm_client)
+    monkeypatch.setattr(approve_service, "draft_reply", draft)
+
+    response = await approve_service.handle_draft(FakeRequest(draft_payload("Can you review?")))
+
+    assert response.status == 204
+    assert response.body in (None, b"")
+    assert approve_service.STATE is not None
+    assert approve_service.STATE.pending == {}
+
+
+@pytest.mark.asyncio
+async def test_handle_draft_llm_garbage_returns_no_content_and_no_pending(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def classify(_text: str) -> NeedsReplyDecision:
+        return NeedsReplyDecision(NEEDS_REPLY, "heuristic", "question mark")
+
+    async def draft(*_args, **_kwargs):
+        return DraftResult(draft=" \n\t", summary=Brief.empty())
+
+    monkeypatch.setattr(approve_service, "classify_needs_reply", classify)
+    monkeypatch.setattr(approve_service, "draft_reply", draft)
+
+    response = await approve_service.handle_draft(FakeRequest(draft_payload("Can you review?")))
+
+    assert response.status == 204
+    assert response.body in (None, b"")
+    assert approve_service.STATE is not None
+    assert approve_service.STATE.pending == {}
+
+
+@pytest.mark.asyncio
+async def test_handle_draft_failure_after_gate_returns_placeholder_cleanup_signal(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async def classify(_text: str) -> NeedsReplyDecision:
@@ -156,10 +241,15 @@ async def test_handle_draft_needs_reply_draft_failure_returns_error(
     monkeypatch.setattr(approve_service, "classify_needs_reply", classify)
     monkeypatch.setattr(approve_service, "draft_reply", draft)
 
-    response = await approve_service.handle_draft(FakeRequest(draft_payload("Can you review?")))
-    body = json.loads(response.text)
+    gate_response = await approve_service.handle_draft_gate(
+        FakeRequest(draft_payload("Can you review?"))
+    )
+    draft_response = await approve_service.handle_draft(
+        FakeRequest(draft_payload("Can you review?"))
+    )
 
-    assert response.status == 500
-    assert body == {"ok": False, "reason": "draft failed: LLM failed after retries"}
+    assert gate_response.status == 200
+    assert draft_response.status == 204
+    assert draft_response.body in (None, b"")
     assert approve_service.STATE is not None
     assert approve_service.STATE.pending == {}

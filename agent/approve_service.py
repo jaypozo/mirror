@@ -55,6 +55,7 @@ load_dotenv()
 
 from agent.corpus import add_owner_sample
 from agent.draft import draft_reply
+from agent.llm import build_llm_client
 from agent.edit_classify import classify_edit
 from agent.eligibility import EXCLUDED_TOPIC_CHAT_ID
 from agent.feedback import record_feedback
@@ -74,6 +75,7 @@ WEBAPP_BOT_TOKEN = (os.getenv("MIRROR_WEBAPP_BOT_TOKEN") or "").strip()
 # Absolute path to the self-contained Mini App HTML (served over the tunnel).
 WEBAPP_HTML_PATH = Path(__file__).resolve().parent.parent / "webapp" / "scoreboard.html"
 PENDING_TTL_SECONDS = 60 * 60  # drafts older than this are swept (nothing sent)
+DRAFT_LLM_TIMEOUT_SECONDS = 60
 
 # Pending drafts are persisted here so a service restart doesn't orphan an
 # undecided card (which would make Approve silently no-op). Only the Pending
@@ -397,7 +399,9 @@ async def handle_draft_gate(request: web.Request) -> web.Response:
 #   }
 #   -> { ok, approval_id, draft, summary: {goal, now, next, open[]} }
 #      or 204 No Content when the needs-reply gate decides no reply is needed
-#      or { ok:false, reason } for real draft/service failures
+#      or 204 No Content when drafting fails after the gate (log-only; callers
+#         should delete any placeholder and render nothing)
+#      or { ok:false, reason } for auth/readiness/bad-json failures
 # --------------------------------------------------------------------------- #
 async def handle_draft(request: web.Request) -> web.Response:
     if not _authorized(request):
@@ -467,10 +471,20 @@ async def handle_draft(request: web.Request) -> web.Response:
     )
 
     try:
-        result = await draft_reply(draft_request, include_summary=True)
+        result = await draft_reply(
+            draft_request,
+            include_summary=True,
+            llm=build_llm_client(timeout_seconds=DRAFT_LLM_TIMEOUT_SECONDS),
+        )
     except Exception as exc:
-        log.exception("draft failed: %s", exc)
-        return web.json_response({"ok": False, "reason": f"draft failed: {exc}"}, status=500)
+        log.exception("draft failed; returning no content: %s", exc)
+        return web.Response(status=204)
+
+    # Belt-and-braces: draft_reply raises on empty output today, but keep this
+    # endpoint contract silent even if a future drafter returns an unusable value.
+    if not (result.draft or "").strip():
+        log.error("draft failed; LLM returned empty/unusable output")
+        return web.Response(status=204)
 
     approval_id = uuid.uuid4().hex[:12]
     STATE.pending[approval_id] = Pending(

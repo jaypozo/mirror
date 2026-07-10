@@ -135,12 +135,6 @@ def format_thread_context(context: ThreadContext | None) -> str:
     return "\n".join(lines) + "\n"
 
 
-def heuristic_draft(request: DraftRequest) -> str:
-    if "?" in request.incoming_message:
-        return "Let me check one detail and get back to you."
-    return "Got it, on it."
-
-
 async def draft_reply(
     request: DraftRequest,
     summary: Brief | None = None,
@@ -211,18 +205,17 @@ Now draft the owner's reply to this incoming message:
 Reply as the owner. Output only the reply text."""
 
     client = llm or build_llm_client()
-    try:
-        response = await client.complete(
-            [
-                {"role": "system", "content": DRAFT_SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ]
-        )
-    except Exception as exc:
-        print(f"[draft] LLM draft failed; using heuristic fallback: {exc}", file=sys.stderr)
-        response = heuristic_draft(request)
+    response = await client.complete(
+        [
+            {"role": "system", "content": DRAFT_SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ]
+    )
 
-    draft = response.strip() or heuristic_draft(request)
+    draft = response.strip()
+    if not draft:
+        raise RuntimeError("LLM returned empty draft")
+
     return DraftResult(
         draft=draft,
         summary=resolved_summary or Brief.empty(),
@@ -234,7 +227,11 @@ Reply as the owner. Output only the reply text."""
 async def main() -> None:
     payload = json.load(sys.stdin)
     request = DraftRequest.from_dict(payload)
-    result = await draft_reply(request)
+    try:
+        result = await draft_reply(request)
+    except Exception as exc:
+        print(f"[draft] draft failed: {exc}", file=sys.stderr)
+        raise SystemExit(1) from None
     print(
         json.dumps(
             {
