@@ -60,8 +60,8 @@ from agent.eligibility import EXCLUDED_TOPIC_CHAT_ID
 from agent.feedback import record_feedback
 from agent.needs_reply import SKIP, NeedsReplyDecision, classify_needs_reply
 from agent.scoreboard import compute_scoreboard, validate_init_data
-from agent.threads import record_intent_note
 from agent.service import maybe_resume_backfill  # reuse the drip resumer as-is
+from agent.threads import record_intent_note
 from agent.types import ChatMessage, DraftRequest, DraftResult
 
 log = logging.getLogger("mirror.approve_service")
@@ -74,6 +74,9 @@ WEBAPP_BOT_TOKEN = (os.getenv("MIRROR_WEBAPP_BOT_TOKEN") or "").strip()
 # Absolute path to the self-contained Mini App HTML (served over the tunnel).
 WEBAPP_HTML_PATH = Path(__file__).resolve().parent.parent / "webapp" / "scoreboard.html"
 PENDING_TTL_SECONDS = 60 * 60  # drafts older than this are swept (nothing sent)
+USER_CONNECT_ATTEMPTS = 3
+USER_CONNECT_BACKOFF_SECONDS = 0.5
+USER_HEALTH_CHECK_INTERVAL_SECONDS = 30
 
 # Pending drafts are persisted here so a service restart doesn't orphan an
 # undecided card (which would make Approve silently no-op). Only the Pending
@@ -100,6 +103,8 @@ class Pending:
 class ServiceState:
     user: TelegramClient
     pending: dict[str, Pending] = field(default_factory=dict)
+    reconnect_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    user_authorization_lost: bool = False
 
 
 STATE: ServiceState | None = None
@@ -113,6 +118,14 @@ SECRET: str = ""
 # first — but the gate is cheap insurance against that invariant changing.
 READY = asyncio.Event()
 WARMUP_WAIT_TIMEOUT_SECONDS = 120
+
+
+class UserReconnectError(RuntimeError):
+    """The existing user session could not be reconnected."""
+
+
+class UserSessionUnauthorizedError(RuntimeError):
+    """The existing user session needs external re-authorization."""
 
 
 # --------------------------------------------------------------------------- #
@@ -144,6 +157,76 @@ async def _wait_until_ready(timeout: float = WARMUP_WAIT_TIMEOUT_SECONDS) -> boo
         return True
     except asyncio.TimeoutError:
         return False
+
+
+async def _ensure_user_connected() -> None:
+    """Reconnect the existing user session without ever starting a login flow."""
+    assert STATE is not None
+    user = STATE.user
+    if user.is_connected():
+        if STATE.user_authorization_lost:
+            raise UserSessionUnauthorizedError(
+                "Telegram user session is not authorized; refusing to log in. "
+                "Re-authenticate outside this service."
+            )
+        return
+
+    async with STATE.reconnect_lock:
+        # Another request or the health task may have restored the connection
+        # while this caller was waiting for the lock.
+        if user.is_connected():
+            if STATE.user_authorization_lost:
+                raise UserSessionUnauthorizedError(
+                    "Telegram user session is not authorized; refusing to log in. "
+                    "Re-authenticate outside this service."
+                )
+            return
+
+        last_error: Exception | None = None
+        for attempt in range(1, USER_CONNECT_ATTEMPTS + 1):
+            try:
+                await user.connect()
+                if not user.is_connected():
+                    raise ConnectionError("connect() returned but the client is still disconnected")
+                if not await user.is_user_authorized():
+                    STATE.user_authorization_lost = True
+                    raise UserSessionUnauthorizedError(
+                        "Telegram user session reconnected but is not authorized; "
+                        "refusing to log in. Re-authenticate outside this service."
+                    )
+                STATE.user_authorization_lost = False
+                log.info("Telegram user session reconnected on attempt %d", attempt)
+                return
+            except UserSessionUnauthorizedError:
+                raise
+            except Exception as exc:
+                last_error = exc
+                log.warning(
+                    "Telegram user session reconnect attempt %d/%d failed: %s",
+                    attempt,
+                    USER_CONNECT_ATTEMPTS,
+                    exc,
+                )
+                if attempt < USER_CONNECT_ATTEMPTS:
+                    await asyncio.sleep(USER_CONNECT_BACKOFF_SECONDS * attempt)
+
+        attempt_word = "attempt" if USER_CONNECT_ATTEMPTS == 1 else "attempts"
+        raise UserReconnectError(
+            "Telegram user session is disconnected and reconnect failed after "
+            f"{USER_CONNECT_ATTEMPTS} {attempt_word}; retry shortly: {last_error}"
+        )
+
+
+async def _user_connection_health_loop() -> None:
+    """Periodically restore a dropped user connection between approvals."""
+    while True:
+        await asyncio.sleep(USER_HEALTH_CHECK_INTERVAL_SECONDS)
+        try:
+            await _ensure_user_connected()
+        except UserSessionUnauthorizedError as exc:
+            log.error("user-session health check requires external re-authorization: %s", exc)
+        except UserReconnectError as exc:
+            log.warning("user-session health check could not reconnect: %s", exc)
 
 
 async def _warm_up() -> None:
@@ -570,6 +653,18 @@ async def handle_decide(request: web.Request) -> web.Response:
 
         try:
             sent_message = await send_as_owner(pending.request, final)
+        except UserReconnectError as exc:
+            log.warning("send-as-owner unavailable: %s", exc)
+            return web.json_response(
+                {"ok": False, "reason": f"send unavailable: {exc}"},
+                status=503,
+            )
+        except UserSessionUnauthorizedError as exc:
+            log.error("send-as-owner authorization lost: %s", exc)
+            return web.json_response(
+                {"ok": False, "reason": f"send unavailable: {exc}"},
+                status=503,
+            )
         except Exception as exc:
             log.exception("send-as-owner failed: %s", exc)
             return web.json_response({"ok": False, "reason": f"send failed: {exc}"}, status=500)
@@ -651,6 +746,7 @@ async def send_as_owner(request: DraftRequest, text: str):
     assert STATE is not None
     if not request.target_chat_id:
         raise RuntimeError("no target_chat_id")
+    await _ensure_user_connected()
     # A bot DM's API chat_id equals the owner's own user id; sending there from the owner's
     # user session routes to Saved Messages, not the DM. Address the bot's peer
     # instead so the reply lands inline in the conversation. Groups (negative
@@ -801,10 +897,18 @@ async def build_and_run() -> None:
         await _warm_up()
         await site.start()
         log.info("Mirror approve service listening on http://%s:%s (loopback)", host, port)
-        # Optional: resume older-history backfill inside THIS user client, so the
-        # single session owner can keep building the corpus. Reuses service.py.
-        await maybe_resume_backfill(user, database_url)
-        await stop.wait()
+        health_task = asyncio.create_task(_user_connection_health_loop())
+        try:
+            # Optional: resume older-history backfill inside THIS user client, so the
+            # single session owner can keep building the corpus. Reuses service.py.
+            await maybe_resume_backfill(user, database_url)
+            await stop.wait()
+        finally:
+            health_task.cancel()
+            try:
+                await health_task
+            except asyncio.CancelledError:
+                pass
 
     await runner.cleanup()
     log.info("Mirror approve service stopped.")
