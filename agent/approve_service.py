@@ -104,6 +104,7 @@ class ServiceState:
     user: TelegramClient
     pending: dict[str, Pending] = field(default_factory=dict)
     reconnect_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    decision_locks: dict[str, asyncio.Lock] = field(default_factory=dict)
     user_authorization_lost: bool = False
 
 
@@ -618,8 +619,24 @@ async def handle_decide(request: web.Request) -> web.Response:
     action = str(body.get("action") or "")
     edited_text = body.get("edited_text")
 
+    # Serialize the full decision lifecycle per approval. The pending entry is
+    # re-read only after acquiring this lock, so a concurrent /decide that
+    # waited through reconnect/send observes the first request's removal and
+    # cannot send the same owner message twice.
+    decision_lock = STATE.decision_locks.setdefault(approval_id, asyncio.Lock())
+    async with decision_lock:
+        return await _handle_decide_locked(approval_id, action, edited_text)
+
+
+async def _handle_decide_locked(
+    approval_id: str,
+    action: str,
+    edited_text: object,
+) -> web.Response:
+    assert STATE is not None
     pending = STATE.pending.get(approval_id)
     if pending is None:
+        STATE.decision_locks.pop(approval_id, None)
         # Unambiguous 410 so the caller (and the plugin) can tell a lost/expired
         # draft apart from a normal decline, even before rendering the reason.
         return web.json_response(
@@ -643,6 +660,7 @@ async def handle_decide(request: web.Request) -> web.Response:
             metadata=pending.request.metadata,
         )
         STATE.pending.pop(approval_id, None)
+        STATE.decision_locks.pop(approval_id, None)
         _save_pending()
         return web.json_response({"ok": True, "action": "dismiss", "sent": False})
 
@@ -723,6 +741,7 @@ async def handle_decide(request: web.Request) -> web.Response:
                 log.warning("record_intent_note failed (ignored): %s", exc)
 
         STATE.pending.pop(approval_id, None)
+        STATE.decision_locks.pop(approval_id, None)
         _save_pending()
         log.info(
             "sent-as-owner approval_id=%s action=%s edit_kind=%s",
@@ -890,7 +909,7 @@ async def build_and_run() -> None:
         except NotImplementedError:
             pass
 
-    async with user:
+    try:
         # Eager-load the embedding model (and any other lazy heavy init the
         # draft path needs) BEFORE binding, so the very first /draft after this
         # restart is never a cold, slow one. See _warm_up for why.
@@ -909,8 +928,9 @@ async def build_and_run() -> None:
                 await health_task
             except asyncio.CancelledError:
                 pass
-
-    await runner.cleanup()
+    finally:
+        await runner.cleanup()
+        await user.disconnect()
     log.info("Mirror approve service stopped.")
 
 
